@@ -1,3 +1,4 @@
+import numpy as np
 from attrs import field, define
 
 from h2integrate.core.utilities import BaseConfig, merge_shared_inputs
@@ -44,6 +45,32 @@ class SimpleGenericStorage(PerformanceModelBaseClass):
             units=self.config.commodity_rate_units,
             desc="Storage charge/discharge rate",
         )
+
+    def setup_partials(self):
+        n = self.n_timesteps
+        arange = np.arange(n)
+        c = self.commodity
+        # identity pass-throughs
+        self.declare_partials(f"{c}_out", f"{c}_set_point", rows=arange, cols=arange, val=1.0)
+        self.declare_partials(f"rated_{c}_production", "max_charge_rate", val=1.0)
+        # total = sum(set_point): dense row of ones
+        self.declare_partials(f"total_{c}_produced", f"{c}_set_point",
+                              rows=np.zeros(n, dtype=int), cols=arange, val=1.0)
+        # annual = total / fraction_of_year: same sparsity, scaled
+        self.declare_partials(f"annual_{c}_produced", f"{c}_set_point",
+                              rows=np.zeros(n, dtype=int), cols=arange,
+                              val=1.0 / self.fraction_of_year_simulated)
+        # capacity_factor depends on state; computed in compute_partials
+        self.declare_partials("capacity_factor", f"{c}_set_point")
+        self.declare_partials("capacity_factor", "max_charge_rate")
+
+    def compute_partials(self, inputs, partials):
+        c = self.commodity
+        rated = float(inputs["max_charge_rate"])
+        denom = rated * self.n_timesteps * (self.dt / 3600)
+        total = float(np.sum(inputs[f"{c}_set_point"]))
+        partials["capacity_factor", f"{c}_set_point"] = np.full(self.n_timesteps, 1.0 / denom)
+        partials["capacity_factor", "max_charge_rate"] = -total / (rated * denom)
 
     def compute(self, inputs, outputs):
         # Pass the commodity_out as the commodity_set_point

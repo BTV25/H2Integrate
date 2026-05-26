@@ -39,6 +39,7 @@ dependencies = [
   "attrs",
   "CoolProp<7.0.0",
   "geopy",
+  "jax[cpu]",
   "jsonschema",
   "marine-carbon-management",
   "matplotlib",

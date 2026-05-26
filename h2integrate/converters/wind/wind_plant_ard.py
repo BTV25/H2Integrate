@@ -1,3 +1,4 @@
+import numpy as np
 import openmdao.api as om
 from attrs import field, define
 
@@ -13,6 +14,61 @@ from h2integrate.core.model_baseclasses import (
     CostModelBaseConfig,
     PerformanceModelBaseClass,
 )
+
+
+class AEPBroadcastComponent(om.ExplicitComponent):
+    """Converts scalar AEP (W*h) to a flat power time-series (kW).
+
+    FLOWFarm produces a single scalar AEP from a wind-rose analysis, but
+    H2Integrate expects a power time-series of length n_timesteps in kW.
+    This component distributes the AEP evenly: P_kw = AEP_Wh / (8760 * 1000).
+    """
+
+    def initialize(self):
+        self.options.declare("n_timesteps", types=int)
+
+    def setup(self):
+        n = self.options["n_timesteps"]
+        self._n = n
+        self._scale = 1.0 / (8760.0 * 1000.0)
+        self.add_input("AEP_farm", val=0.0, units="W*h")
+        self.add_output("ard_electricity_out", val=np.zeros(n), units="kW")
+
+    def setup_partials(self):
+        self.declare_partials(
+            "ard_electricity_out", "AEP_farm",
+            val=np.full((self._n, 1), self._scale),
+        )
+
+    def compute(self, inputs, outputs):
+        outputs["ard_electricity_out"] = np.full(
+            self._n, inputs["AEP_farm"].item() * self._scale
+        )
+
+
+class BatchPowerKWComponent(om.ExplicitComponent):
+    """Converts FLOWFarmBatchPower output (W, n_timesteps) to kW time-series.
+
+    FLOWFarmBatchPower returns per-state farm power in Watts in temporal order.
+    H2Integrate expects a power time-series of length n_timesteps in kW.
+    """
+
+    def initialize(self):
+        self.options.declare("n_timesteps", types=int)
+
+    def setup(self):
+        n = self.options["n_timesteps"]
+        self.add_input("power_farm", val=np.zeros(n), units="W")
+        self.add_output("ard_electricity_out", val=np.zeros(n), units="kW")
+
+    def setup_partials(self):
+        n = self.options["n_timesteps"]
+        idx = np.arange(n)
+        self.declare_partials("ard_electricity_out", "power_farm",
+                              rows=idx, cols=idx, val=1e-3)
+
+    def compute(self, inputs, outputs):
+        outputs["ard_electricity_out"] = inputs["power_farm"] * 1e-3
 
 
 @define
@@ -75,6 +131,19 @@ class WindArdPerformanceCompatibilityComponent(PerformanceModelBaseClass):
             units=self.commodity_rate_units,
         )
 
+    def setup_partials(self):
+        n = self.n_timesteps
+        pl = self.plant_life
+        idx = np.arange(n)
+        self.declare_partials("electricity_out", "ard_electricity_out", rows=idx, cols=idx, val=1.0)
+        self.declare_partials("total_electricity_produced", "ard_electricity_out",
+                              val=np.ones((1, n)))
+        scale = 1.0 / self.fraction_of_year_simulated
+        self.declare_partials("annual_electricity_produced", "ard_electricity_out",
+                              val=np.full((pl, n), scale))
+        self.declare_partials("capacity_factor", "ard_electricity_out",
+                              val=np.full((pl, n), scale / self.plant_capacity))
+
     def compute(self, inputs, outputs):
         ard_electricity_series = inputs["ard_electricity_out"]
 
@@ -108,6 +177,10 @@ class WindArdCostCompatibilityComponent(CostModelBaseClass):
 
         self.add_input("ard_CapEx", val=0, units="USD")
         self.add_input("ard_OpEx", val=0.0, units="USD/year")
+
+    def setup_partials(self):
+        self.declare_partials("CapEx", "ard_CapEx", val=1.0)
+        self.declare_partials("OpEx", "ard_OpEx", val=1.0)
 
     def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
         outputs["CapEx"] = inputs["ard_CapEx"]
@@ -160,24 +233,63 @@ class ArdWindPlantModel(om.Group):
         ard_data_path = self.config.ard_data_path
         ard_prob = set_up_ard_model(input_dict=ard_input_dict, root_data_path=ard_data_path)
 
-        # add ard to the h2i model as a sub-problem
-        subprob_ard = om.SubmodelComp(
-            problem=ard_prob,
-            inputs=[
-                "spacing_primary",
-                "spacing_secondary",
-                "angle_orientation",
-                "angle_skew",
-                "x_substations",
-                "y_substations",
-            ],
-            outputs=[
-                ("aepFLORIS.power_farm", "ard_electricity_out"),
+        # detect FLOWFarm vs FLORIS and wind resource mode
+        modeling_options = ard_input_dict.get("modeling_options", {})
+        use_flowfarm = "flowfarm" in modeling_options
+        wind_resource = (
+            modeling_options
+            .get("windIO_plant", {})
+            .get("site", {})
+            .get("energy_resource", {})
+            .get("wind_resource", {})
+        )
+        # timeseries mode → FLOWFarmBatchPower returns per-state power_farm (W)
+        # probability mode → FLOWFarmAEP returns scalar AEP_farm (W*h)
+        use_batch_power = use_flowfarm and "time" in wind_resource
+
+        if use_batch_power:
+            subprob_outputs = [
+                ("power_farm", "power_farm"),
                 ("tcc.tcc", "ard_CapEx"),
                 ("opex.opex", "ard_OpEx"),
                 "boundary_distances",
                 "turbine_spacing",
+            ]
+        elif use_flowfarm:
+            subprob_outputs = [
+                ("AEP_farm", "AEP_farm"),
+                ("tcc.tcc", "ard_CapEx"),
+                ("opex.opex", "ard_OpEx"),
+                "boundary_distances",
+                "turbine_spacing",
+            ]
+        else:
+            subprob_outputs = [
+                ("power_farm", "ard_electricity_out"),
+                ("tcc.tcc", "ard_CapEx"),
+                ("opex.opex", "ard_OpEx"),
+                "boundary_distances",
+                "turbine_spacing",
+            ]
+
+        # SubmodelComp's analytic total-Jacobian path (approx=False) currently returns
+        # zero gradients through the inner model for reasons not yet diagnosed. As a
+        # workaround, approx_totals=FD on the inner model forces SubmodelComp to use
+        # finite-differences for the total Jacobian, which correctly calls FLOWFarmBatchPower.
+        # Side-effect: 1 FLOWFarm evaluation per DV per gradient step (N_x + N_y = 50 calls).
+        # TODO: remove once the analytic SubmodelComp path is debugged.
+        # ard_prob.model.approx_totals(method="fd", step=50.0)  # disabled for analytic path test
+
+        # add ard to the h2i model as a sub-problem
+        subprob_ard = om.SubmodelComp(
+            problem=ard_prob,
+            inputs=[
+                "x_turbines",
+                "y_turbines",
+                "x_substations",
+                "y_substations",
             ],
+            outputs=subprob_outputs,
         )
 
         # add the ard sub-problem to the parent group
@@ -186,6 +298,22 @@ class ArdWindPlantModel(om.Group):
             subprob_ard,
             promotes=["*"],
         )
+
+        n_timesteps = self.options["plant_config"]["plant"]["simulation"]["n_timesteps"]
+        if use_batch_power:
+            # FLOWFarmBatchPower: per-state power (W, length n_timesteps) → kW time-series
+            self.add_subsystem(
+                "batch_power_kw",
+                BatchPowerKWComponent(n_timesteps=n_timesteps),
+                promotes=["*"],
+            )
+        elif use_flowfarm:
+            # FLOWFarmAEP: scalar AEP (W*h) → flat kW time-series
+            self.add_subsystem(
+                "aep_broadcast",
+                AEPBroadcastComponent(n_timesteps=n_timesteps),
+                promotes=["*"],
+            )
 
         # add performance model to include inputs and
         # outputs as expected by H2Integrate
@@ -199,7 +327,10 @@ class ArdWindPlantModel(om.Group):
             promotes=["*"],
         )
 
-        # add pass-through cost model to include cost_year as expected by H2Integrate
+        # add pass-through cost model to include cost_year as expected by H2Integrate.
+        # Promote everything EXCEPT cost_year — cost_year is a discrete constant that
+        # must not appear in the derivative chain from x_turbines (which flows through
+        # ard_CapEx into this component). A separate IndepVarComp owns cost_year instead.
         self.add_subsystem(
             "wind_ard_cost_compatibility",
             WindArdCostCompatibilityComponent(
@@ -207,5 +338,13 @@ class ArdWindPlantModel(om.Group):
                 plant_config=self.options["plant_config"],
                 tech_config=self.options["tech_config"],
             ),
-            promotes=["*"],
+            promotes_inputs=["*"],
+            promotes_outputs=["CapEx", "OpEx", "VarOpEx"],
         )
+
+        # Provide cost_year independently so it has no dependency on continuous DVs.
+        cost_params = self.options["tech_config"]["model_inputs"].get("cost_parameters", {})
+        cost_year = int(cost_params.get("cost_year", 2024))
+        cost_year_ivc = om.IndepVarComp()
+        cost_year_ivc.add_discrete_output("cost_year", val=cost_year)
+        self.add_subsystem("cost_year_src", cost_year_ivc, promotes_outputs=["cost_year"])

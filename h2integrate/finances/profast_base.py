@@ -591,6 +591,9 @@ class ProFastBase(om.ExplicitComponent):
         coproduct_cost_params.setdefault("unit", self.price_units.replace("USD", "$"))
         self.coproduct_cost_settings = ProFASTDefaultCoproduct.from_dict(coproduct_cost_params)
 
+    def setup_partials(self):
+        self.declare_partials("*", "*", method="fd")
+
     def populate_profast(self, inputs):
         """Populate and configure the ProFAST financial model for analysis.
 

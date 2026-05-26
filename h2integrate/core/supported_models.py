@@ -29,6 +29,7 @@ from h2integrate.converters.wind.atb_wind_cost import ATBWindPlantCostModel
 from h2integrate.storage.battery.pysam_battery import PySAMBatteryPerformanceModel
 from h2integrate.transporters.generic_combiner import GenericCombinerPerformanceModel
 from h2integrate.transporters.generic_splitter import GenericSplitterPerformanceModel
+from h2integrate.financials.h2_revenue_model import H2RevenueModel
 from h2integrate.converters.iron.iron_dri_plant import (
     HydrogenIronReductionPlantCostComponent,
     NaturalGasIronReductionPlantCostComponent,
@@ -264,6 +265,7 @@ supported_models = {
     "pipe": PipePerformanceModel,
     "GenericCombinerPerformanceModel": GenericCombinerPerformanceModel,
     "GenericSplitterPerformanceModel": GenericSplitterPerformanceModel,
+    "H2RevenueModel": H2RevenueModel,
     "GenericTransporterPerformanceModel": GenericTransporterPerformanceModel,
     "IronTransportPerformanceComponent": IronTransportPerformanceComponent,
     "IronTransportCostComponent": IronTransportCostComponent,

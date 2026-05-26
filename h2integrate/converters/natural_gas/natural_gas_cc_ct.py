@@ -122,6 +122,75 @@ class NaturalGasPerformanceModel(PerformanceModelBaseClass):
             desc="Unmet electricity demand for natural gas plant",
         )
 
+    def setup_partials(self):
+        n = self.options["plant_config"]["plant"]["simulation"]["n_timesteps"]
+        arange = np.arange(n)
+        # Diagonal Jacobians for the time-series inputs (no cross-time coupling)
+        for out in ("electricity_out", "natural_gas_consumed", "unmet_electricity_demand"):
+            self.declare_partials(out, "natural_gas_in", rows=arange, cols=arange)
+            self.declare_partials(out, "electricity_demand", rows=arange, cols=arange)
+        self.declare_partials("total_electricity_produced", "natural_gas_in",
+                              rows=np.zeros(n, dtype=int), cols=arange)
+        self.declare_partials("total_electricity_produced", "electricity_demand",
+                              rows=np.zeros(n, dtype=int), cols=arange)
+        self.declare_partials("capacity_factor", "natural_gas_in",
+                              rows=np.zeros(n, dtype=int), cols=arange)
+        self.declare_partials("capacity_factor", "electricity_demand",
+                              rows=np.zeros(n, dtype=int), cols=arange)
+        self.declare_partials("annual_electricity_produced", "natural_gas_in",
+                              rows=np.zeros(n, dtype=int), cols=arange)
+        self.declare_partials("annual_electricity_produced", "electricity_demand",
+                              rows=np.zeros(n, dtype=int), cols=arange)
+        # Scalar inputs use FD (not on the critical gradient path)
+        self.declare_partials("*", "system_capacity", method="fd")
+        self.declare_partials("*", "heat_rate_mmbtu_per_mwh", method="fd")
+        self.declare_partials("rated_electricity_production", "system_capacity",
+                              method="exact", val=1.0)
+
+    def compute_partials(self, inputs, partials):
+        system_capacity = float(inputs["system_capacity"])
+        heat_rate = float(inputs["heat_rate_mmbtu_per_mwh"])
+        max_ng = system_capacity * heat_rate
+        elec_demand_raw = inputs["electricity_demand"]
+        ng_in = inputs["natural_gas_in"]
+
+        demand_sat = np.where(elec_demand_raw > system_capacity, system_capacity, elec_demand_raw)
+        ng_demand = demand_sat * heat_rate
+        ng_avail = np.where(ng_in > max_ng, max_ng, ng_in)
+        ng_consumed = np.minimum(ng_demand, ng_avail)
+
+        supply_binding = ng_avail < ng_demand
+        demand_unsaturated = elec_demand_raw < system_capacity
+        ng_unsaturated = ng_in < max_ng
+
+        # d(ng_consumed)/d(ng_in): 1 where feedstock is the binding constraint
+        d_ngc_d_ngin = np.where(supply_binding & ng_unsaturated, 1.0, 0.0)
+        # d(ng_consumed)/d(elec_demand): heat_rate where demand is binding and unsaturated
+        d_ngc_d_ed = np.where(~supply_binding & demand_unsaturated, heat_rate, 0.0)
+
+        d_eo_d_ngin = d_ngc_d_ngin / heat_rate
+        d_eo_d_ed = d_ngc_d_ed / heat_rate  # = 1 where demand binding & unsaturated
+
+        partials["electricity_out", "natural_gas_in"] = d_eo_d_ngin
+        partials["electricity_out", "electricity_demand"] = d_eo_d_ed
+        partials["natural_gas_consumed", "natural_gas_in"] = d_ngc_d_ngin
+        partials["natural_gas_consumed", "electricity_demand"] = d_ngc_d_ed
+        partials["unmet_electricity_demand", "natural_gas_in"] = -d_eo_d_ngin
+        partials["unmet_electricity_demand", "electricity_demand"] = 1.0 - d_eo_d_ed
+
+        dt_h = self.dt / 3600
+        partials["total_electricity_produced", "natural_gas_in"] = d_eo_d_ngin * dt_h
+        partials["total_electricity_produced", "electricity_demand"] = d_eo_d_ed * dt_h
+
+        n = len(ng_in)
+        cap_denom = system_capacity * n * dt_h
+        partials["capacity_factor", "natural_gas_in"] = d_eo_d_ngin * dt_h / cap_denom
+        partials["capacity_factor", "electricity_demand"] = d_eo_d_ed * dt_h / cap_denom
+
+        foy = self.fraction_of_year_simulated
+        partials["annual_electricity_produced", "natural_gas_in"] = d_eo_d_ngin * dt_h / foy
+        partials["annual_electricity_produced", "electricity_demand"] = d_eo_d_ed * dt_h / foy
+
     def compute(self, inputs, outputs):
         """
         Compute electricity output from natural gas input.

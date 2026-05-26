@@ -111,6 +111,10 @@ class DemandOpenLoopControlBase(om.ExplicitComponent):
             desc="Total unmet demand",
         )
 
+    def setup_partials(self):
+        """Subclasses should override this to declare analytic partials."""
+        pass
+
     def compute():
         """This method must be implemented by subclasses to define the
         controller.

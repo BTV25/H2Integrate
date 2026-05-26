@@ -76,6 +76,18 @@ class ATBBatteryCostModel(CostModelBaseClass):
             desc="Battery storage capacity",
         )
 
+    def setup_partials(self):
+        k_cap = units.unit_conversion(f"{self.config.commodity_rate_units}*h", "kW*h")[0]
+        k_rate = units.unit_conversion(self.config.commodity_rate_units, "kW")[0]
+        e = float(self.config.energy_capex)
+        p = float(self.config.power_capex)
+        f = float(self.config.opex_fraction)
+        # CapEx = energy_capex * max_capacity_kWh + power_capex * max_charge_rate_kW
+        self.declare_partials("CapEx", "max_capacity", val=e * k_cap)
+        self.declare_partials("CapEx", "max_charge_rate", val=p * k_rate)
+        self.declare_partials("OpEx", "max_capacity", val=f * e * k_cap)
+        self.declare_partials("OpEx", "max_charge_rate", val=f * p * k_rate)
+
     def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
         storage_duration_hrs = 0.0
 

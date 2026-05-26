@@ -1,5 +1,7 @@
 from copy import deepcopy
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 from attrs import field, define
 
@@ -9,6 +11,83 @@ from h2integrate.control.control_strategies.demand_openloop_controller import (
     DemandOpenLoopControlBase,
     DemandOpenLoopControlBaseConfig,
 )
+
+
+def _make_jax_compute(
+    max_charge_fraction,
+    min_charge_fraction,
+    init_charge_fraction,
+    charge_efficiency,
+    discharge_efficiency,
+    charge_equals_discharge,
+    fixed_max_discharge_rate,
+):
+    """Returns a pure JAX function implementing the storage controller time-step scan.
+
+    When charge_equals_discharge=True, max_discharge_rate tracks max_charge_rate
+    (so gradients flow through it). Otherwise fixed_max_discharge_rate is a constant.
+    """
+
+    def jax_compute(commodity_in, demand, max_charge_rate, max_capacity):
+        mdr = (
+            max_charge_rate
+            if charge_equals_discharge
+            else jnp.array(fixed_max_discharge_rate, dtype=max_charge_rate.dtype)
+        )
+
+        def step(soc, x):
+            demand_t, input_flow = x[0], x[1]
+
+            avail_discharge = jnp.maximum(0.0, (soc - min_charge_fraction) * max_capacity)
+            avail_charge = jnp.maximum(0.0, (max_charge_fraction - soc) * max_capacity)
+
+            discharge = jnp.minimum(
+                jnp.minimum(
+                    jnp.maximum(0.0, demand_t - input_flow) / discharge_efficiency,
+                    avail_discharge,
+                ),
+                mdr / discharge_efficiency,
+            )
+
+            unused_input = jnp.maximum(0.0, input_flow - demand_t)
+            charge = (
+                jnp.maximum(
+                    0.0,
+                    jnp.minimum(
+                        jnp.minimum(unused_input, avail_charge / charge_efficiency),
+                        max_charge_rate,
+                    ),
+                )
+                * charge_efficiency
+            )
+
+            discharging = demand_t > input_flow
+            act_discharge = jnp.where(discharging, discharge, 0.0)
+            act_charge = jnp.where(discharging, 0.0, charge)
+            act_unused = jnp.where(discharging, 0.0, unused_input)
+
+            new_soc = jnp.clip(
+                soc + (act_charge - act_discharge) / max_capacity,
+                min_charge_fraction,
+                max_charge_fraction,
+            )
+            output = jnp.where(
+                discharging,
+                input_flow + act_discharge * discharge_efficiency,
+                demand_t,
+            )
+            unused_commodity = jnp.maximum(0.0, act_unused - act_charge / charge_efficiency)
+            unmet = jnp.maximum(0.0, demand_t - output)
+
+            return new_soc, (output, new_soc, unused_commodity, unmet)
+
+        init_soc = jnp.array(init_charge_fraction, dtype=commodity_in.dtype)
+        _, (set_point, soc_arr, unused, unmet) = jax.lax.scan(
+            step, init_soc, jnp.stack([demand, commodity_in], axis=-1)
+        )
+        return set_point, soc_arr, unused, unmet, jnp.sum(unmet)
+
+    return jax_compute
 
 
 @define(kw_only=True)
@@ -98,6 +177,7 @@ class DemandOpenLoopStorageControllerConfig(DemandOpenLoopControlBaseConfig):
                 raise ValueError(msg)
 
             self.max_discharge_rate = self.max_charge_rate
+
 
 
 class DemandOpenLoopStorageController(DemandOpenLoopControlBase):
@@ -354,3 +434,72 @@ class DemandOpenLoopStorageController(DemandOpenLoopControlBase):
 
         # Output the storage duration in hours
         outputs["storage_duration"] = max_capacity / max_discharge_rate
+
+    def setup_partials(self):
+        commodity = self.config.commodity
+        cfg = self.config
+
+        ts_out = [
+            f"{commodity}_set_point",
+            f"{commodity}_soc",
+            f"{commodity}_unused_commodity",
+            f"{commodity}_unmet_demand",
+        ]
+        all_out = ts_out + [f"total_{commodity}_unmet_demand"]
+        all_in = [f"{commodity}_in", f"{commodity}_demand", "max_charge_rate", "max_capacity"]
+
+        for out in all_out:
+            for inp in all_in:
+                self.declare_partials(out, inp)
+        self.declare_partials("storage_duration", ["max_charge_rate", "max_capacity"])
+
+        fixed_mdr = None if cfg.charge_equals_discharge else float(cfg.max_discharge_rate)
+        self._jax_jac = jax.jit(
+            jax.jacobian(
+                _make_jax_compute(
+                    cfg.max_charge_fraction,
+                    cfg.min_charge_fraction,
+                    cfg.init_charge_fraction,
+                    float(cfg.charge_efficiency),
+                    float(cfg.discharge_efficiency),
+                    cfg.charge_equals_discharge,
+                    fixed_mdr,
+                ),
+                argnums=(0, 1, 2, 3),
+            )
+        )
+
+    def compute_partials(self, inputs, partials):
+        commodity = self.config.commodity
+
+        ci = jnp.array(inputs[f"{commodity}_in"])
+        demand = jnp.array(inputs[f"{commodity}_demand"])
+        max_charge_rate = jnp.array(inputs["max_charge_rate"][0])
+        max_capacity = jnp.array(inputs["max_capacity"][0])
+
+        # jac[i_out][i_in]: Jacobian of output i_out wrt arg i_in
+        # out order: (set_point, soc, unused, unmet, total_unmet)
+        # arg order: (ci, demand, max_charge_rate, max_capacity)
+        jac = self._jax_jac(ci, demand, max_charge_rate, max_capacity)
+
+        out_names = [
+            f"{commodity}_set_point",
+            f"{commodity}_soc",
+            f"{commodity}_unused_commodity",
+            f"{commodity}_unmet_demand",
+            f"total_{commodity}_unmet_demand",
+        ]
+        in_names = [f"{commodity}_in", f"{commodity}_demand", "max_charge_rate", "max_capacity"]
+
+        for i_out, out in enumerate(out_names):
+            for i_in, inp in enumerate(in_names):
+                partials[out, inp] = np.array(jac[i_out][i_in])
+
+        # storage_duration = max_capacity / max_discharge_rate (analytic)
+        mc = float(inputs["max_capacity"][0])
+        mcr = float(inputs["max_charge_rate"][0])
+        mdr = mcr if self.config.charge_equals_discharge else float(self.config.max_discharge_rate)
+        partials["storage_duration", "max_capacity"] = 1.0 / mdr
+        partials["storage_duration", "max_charge_rate"] = (
+            -mc / mdr**2 if self.config.charge_equals_discharge else 0.0
+        )

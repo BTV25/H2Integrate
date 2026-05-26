@@ -165,27 +165,29 @@ class PoseOptimization:
 
         if self.config["driver"].get("optimization", {}).get("flag", False):
             opt_options = self.config["driver"]["optimization"]
-            step_size = self._get_step_size()
 
-            if "step_calc" in opt_options.keys():
-                if opt_options["step_calc"] == "None":
+            if opt_options.get("approx_totals", True):
+                step_size = self._get_step_size()
+
+                if "step_calc" in opt_options.keys():
+                    if opt_options["step_calc"] == "None":
+                        step_calc = None
+                    else:
+                        step_calc = opt_options["step_calc"]
+                else:
                     step_calc = None
-                else:
-                    step_calc = opt_options["step_calc"]
-            else:
-                step_calc = None
 
-            if "form" in opt_options.keys():
-                if opt_options["form"] == "None":
+                if "form" in opt_options.keys():
+                    if opt_options["form"] == "None":
+                        form = None
+                    else:
+                        form = opt_options["form"]
+                else:
                     form = None
-                else:
-                    form = opt_options["form"]
-            else:
-                form = None
 
-            opt_prob.model.approx_totals(
-                method="fd", step=step_size, form=form, step_calc=step_calc
-            )
+                opt_prob.model.approx_totals(
+                    method="fd", step=step_size, form=form, step_calc=step_calc
+                )
 
             # Set optimization solver and options. First, Scipy's SLSQP and COBYLA
             if opt_options["solver"] in self.scipy_methods:

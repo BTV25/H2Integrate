@@ -1,3 +1,4 @@
+import numpy as np
 import openmdao.api as om
 from attrs import field, define
 
@@ -51,6 +52,8 @@ class GenericCombinerPerformanceModel(om.ExplicitComponent):
 
         n_timesteps = int(self.options["plant_config"]["plant"]["simulation"]["n_timesteps"])
         plant_life = int(self.options["plant_config"]["plant"]["plant_life"])
+        self._n_timesteps = n_timesteps
+        self._plant_life = plant_life
 
         for i in range(1, self.config.in_streams + 1):
             self.add_input(
@@ -88,6 +91,64 @@ class GenericCombinerPerformanceModel(om.ExplicitComponent):
             val=0.0,
             units=self.config.commodity_rate_units,
         )
+
+    def setup_partials(self):
+        commodity = self.config.commodity
+        n = self._n_timesteps
+        p = self._plant_life
+
+        for i in range(1, self.config.in_streams + 1):
+            # commodity_out[t] = sum_i commodity_in_i[t]: identity per stream
+            self.declare_partials(
+                f"{commodity}_out", f"{commodity}_in{i}",
+                rows=np.arange(n), cols=np.arange(n), val=1.0,
+            )
+            # rated_production = sum_i rated_production_i: scalar 1.0 per stream
+            self.declare_partials(
+                f"rated_{commodity}_production",
+                f"rated_{commodity}_production{i}",
+                val=1.0,
+            )
+            # capacity_factor = sum(CF_i*S_i) / sum(S_i): nonlinear wrt CF_i and S_i
+            self.declare_partials(
+                "capacity_factor", f"{commodity}_capacity_factor{i}",
+                rows=np.arange(p), cols=np.arange(p),
+            )
+            self.declare_partials(
+                "capacity_factor", f"rated_{commodity}_production{i}",
+            )
+
+    def compute_partials(self, inputs, partials):
+        commodity = self.config.commodity
+
+        total_rated = sum(
+            inputs[f"rated_{commodity}_production{i}"].item()
+            for i in range(1, self.config.in_streams + 1)
+        )
+
+        if total_rated > 0:
+            combined_production = sum(
+                inputs[f"{commodity}_capacity_factor{i}"]
+                * inputs[f"rated_{commodity}_production{i}"].item()
+                for i in range(1, self.config.in_streams + 1)
+            )
+            capacity_factor = combined_production / total_rated
+
+            for i in range(1, self.config.in_streams + 1):
+                S_i = inputs[f"rated_{commodity}_production{i}"].item()
+                CF_i = inputs[f"{commodity}_capacity_factor{i}"]
+                # d(cf)/d(CF_i)[t] = S_i / total_rated  (diagonal)
+                partials["capacity_factor", f"{commodity}_capacity_factor{i}"] = (
+                    S_i / total_rated
+                )
+                # d(cf)/d(S_i)[t] = (CF_i[t] - cf[t]) / total_rated
+                partials["capacity_factor", f"rated_{commodity}_production{i}"] = (
+                    (CF_i - capacity_factor) / total_rated
+                )
+        else:
+            for i in range(1, self.config.in_streams + 1):
+                partials["capacity_factor", f"{commodity}_capacity_factor{i}"] = 0.0
+                partials["capacity_factor", f"rated_{commodity}_production{i}"] = 0.0
 
     def compute(self, inputs, outputs):
         total_out = 0.0
