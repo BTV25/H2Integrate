@@ -74,6 +74,7 @@ class GenericSplitterPerformanceModel(om.ExplicitComponent):
             self.options["tech_config"]["model_inputs"]["performance_parameters"],
             additional_cls_name=self.__class__.__name__,
         )
+        self.n_timesteps = self.options["plant_config"]["plant"]["simulation"]["n_timesteps"]
 
         self.add_input(
             f"{self.config.commodity}_in",
@@ -113,6 +114,31 @@ class GenericSplitterPerformanceModel(om.ExplicitComponent):
             units=self.config.commodity_rate_units,
             desc=f"{self.config.commodity} output to the second technology",
         )
+
+    def setup_partials(self):
+        c = self.config.commodity
+        n = self.n_timesteps
+        arange = np.arange(n)
+        if self.config.split_mode == "prescribed_commodity":
+            self.declare_partials(f"{c}_out1", f"{c}_in", rows=arange, cols=arange)
+            self.declare_partials(f"{c}_out2", f"{c}_in", rows=arange, cols=arange)
+            self.declare_partials(f"{c}_out1", "prescribed_commodity_to_priority_tech",
+                                  rows=arange, cols=arange)
+            self.declare_partials(f"{c}_out2", "prescribed_commodity_to_priority_tech",
+                                  rows=arange, cols=arange)
+        else:
+            self.declare_partials("*", "*", method="cs")
+
+    def compute_partials(self, inputs, partials):
+        c = self.config.commodity
+        if self.config.split_mode == "prescribed_commodity":
+            cin = inputs[f"{c}_in"]
+            prescribed = inputs["prescribed_commodity_to_priority_tech"]
+            input_binding = cin < prescribed
+            partials[f"{c}_out1", f"{c}_in"] = np.where(input_binding, 1.0, 0.0)
+            partials[f"{c}_out1", "prescribed_commodity_to_priority_tech"] = np.where(input_binding, 0.0, 1.0)
+            partials[f"{c}_out2", f"{c}_in"] = np.where(input_binding, 0.0, 1.0)
+            partials[f"{c}_out2", "prescribed_commodity_to_priority_tech"] = np.where(input_binding, 0.0, -1.0)
 
     def compute(self, inputs, outputs):
         commodity_in = inputs[f"{self.config.commodity}_in"]

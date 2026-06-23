@@ -46,17 +46,22 @@ class H2RevenueModel(om.ExplicitComponent):
         self.add_output(
             "replacement_schedule", val=0.0, shape=self.plant_life, units="unitless"
         )
-        self.add_discrete_output("cost_year", val=self.cost_year_val)
 
     def setup_partials(self):
-        self.declare_partials("VarOpEx", "hydrogen_in", method="fd")
+        pl = self.plant_life
+        n_ts = self.options["plant_config"]["plant"]["simulation"]["n_timesteps"]
+        rows = np.repeat(np.arange(pl), n_ts)
+        cols = np.tile(np.arange(n_ts), pl)
+        self.declare_partials("VarOpEx", "hydrogen_in", rows=rows, cols=cols)
 
-    def compute(self, inputs, outputs, discrete_inputs=None, discrete_outputs=None):
+    def compute_partials(self, inputs, partials):
+        n_ts = inputs["hydrogen_in"].size
+        partials["VarOpEx", "hydrogen_in"] = np.full(self.plant_life * n_ts, -self.h2_price)
+
+    def compute(self, inputs, outputs):
         annual_h2_kg = np.sum(inputs["hydrogen_in"])  # kg/yr
         annual_revenue = annual_h2_kg * self.h2_price  # USD/yr
         outputs["CapEx"] = 0.0
         outputs["OpEx"] = 0.0
         outputs["VarOpEx"] = np.full(self.plant_life, -annual_revenue)
         outputs["replacement_schedule"] = np.zeros(self.plant_life)
-        if discrete_outputs is not None:
-            discrete_outputs["cost_year"] = self.cost_year_val

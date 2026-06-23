@@ -1166,10 +1166,6 @@ class H2IntegrateModel:
                     self.plant.connect(
                         f"{tech_name}.VarOpEx", f"finance_subgroup_{group_id}.varopex_{tech_name}"
                     )
-                    self.plant.connect(
-                        f"{tech_name}.cost_year",
-                        f"finance_subgroup_{group_id}.cost_year_{tech_name}",
-                    )
 
                     if is_system_finance_model and "transport" not in tech_name:
                         # connect replacement schedule to system-level finance models

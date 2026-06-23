@@ -182,7 +182,7 @@ class WindArdCostCompatibilityComponent(CostModelBaseClass):
         self.declare_partials("CapEx", "ard_CapEx", val=1.0)
         self.declare_partials("OpEx", "ard_OpEx", val=1.0)
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         outputs["CapEx"] = inputs["ard_CapEx"]
         outputs["OpEx"] = inputs["ard_OpEx"]
 
@@ -231,6 +231,13 @@ class ArdWindPlantModel(om.Group):
         # create ard model
         ard_input_dict = self.config.ard_system
         ard_data_path = self.config.ard_data_path
+
+        # Debug: check what N_turbines is in ard_input_dict
+        n_turbines = ard_input_dict.get("modeling_options", {}).get("layout", {}).get("N_turbines")
+        x_turbines = ard_input_dict.get("modeling_options", {}).get("layout", {}).get("x_turbines", [])
+        y_turbines = ard_input_dict.get("modeling_options", {}).get("layout", {}).get("y_turbines", [])
+        print(f"[ArdWindPlantModel.setup] N_turbines={n_turbines}, x_turbines count={len(x_turbines)}, y_turbines count={len(y_turbines)}", flush=True)
+
         ard_prob = set_up_ard_model(input_dict=ard_input_dict, root_data_path=ard_data_path)
 
         # detect FLOWFarm vs FLORIS and wind resource mode
@@ -250,6 +257,7 @@ class ArdWindPlantModel(om.Group):
         if use_batch_power:
             subprob_outputs = [
                 ("power_farm", "power_farm"),
+                ("power_turbines", "power_turbines"),
                 ("tcc.tcc", "ard_CapEx"),
                 ("opex.opex", "ard_OpEx"),
                 "boundary_distances",
@@ -281,11 +289,12 @@ class ArdWindPlantModel(om.Group):
         # ard_prob.model.approx_totals(method="fd", step=50.0)  # disabled for analytic path test
 
         # add ard to the h2i model as a sub-problem
+        # Note: x_turbines and y_turbines are outputs of CartesianLayout (read from config),
+        # not inputs to the problem, so we don't expose them as SubmodelComponent inputs.
+        # x_substations/y_substations remain as inputs for substation placement (if optimized).
         subprob_ard = om.SubmodelComp(
             problem=ard_prob,
             inputs=[
-                "x_turbines",
-                "y_turbines",
                 "x_substations",
                 "y_substations",
             ],

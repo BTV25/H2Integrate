@@ -1,9 +1,39 @@
+import numpy as np
+import jax
+import jax.numpy as jnp
 from attrs import field, define
 
 from h2integrate.core.utilities import merge_shared_inputs
 from h2integrate.core.validators import contains, must_equal
 from h2integrate.core.model_baseclasses import CostModelBaseConfig
 from h2integrate.converters.hydrogen.electrolyzer_baseclass import ElectrolyzerCostBaseClass
+
+jax.config.update("jax_enable_x64", True)
+
+
+def _make_jax_singlitico_compute(location, electrolyzer_capex):
+    loc = 0.0 if location == "onshore" else 1.0
+
+    def compute(x):
+        P = x[0] * 1e-3                          # GW
+        SF = jnp.where(P < 10.0 / 1e3, -0.21, -0.14)
+        P_cost = jnp.minimum(P, 0.1)            # cap at 100 MW
+
+        unit_capex_musd = (
+            electrolyzer_capex * (1.0 + 0.33 * loc)
+            * (P_cost * 1e3 / 10.0) ** SF
+        )
+        capital_musd = unit_capex_musd * P   # total capital cost [MUSD]
+        CapEx = capital_musd * 1e6
+
+        P_opex = jnp.minimum(P, 0.1)
+        opex_eq = capital_musd * (1.0 - 0.33 * (1.0 + loc)) * 0.0344 * (P_opex * 1e3) ** -0.155
+        opex_neq = 0.04 * capital_musd * 0.33 * (1.0 + loc)
+        OpEx = (opex_eq + opex_neq) * 1e6
+
+        return jnp.stack([CapEx, OpEx])
+
+    return compute
 
 
 @define(kw_only=True)
@@ -44,7 +74,21 @@ class SingliticoCostModel(ElectrolyzerCostBaseClass):
             desc="Size of the electrolyzer in MW",
         )
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def setup_partials(self):
+        self.declare_partials("CapEx", "electrolyzer_size_mw")
+        self.declare_partials("OpEx", "electrolyzer_size_mw")
+        _fn = _make_jax_singlitico_compute(
+            self.config.location, float(self.config.electrolyzer_capex)
+        )
+        self._jax_jac = jax.jit(jax.jacobian(_fn))
+
+    def compute_partials(self, inputs, partials):
+        x = jnp.array([float(inputs["electrolyzer_size_mw"][0])])
+        jac = self._jax_jac(x)
+        partials["CapEx", "electrolyzer_size_mw"] = np.array(jac[0])
+        partials["OpEx", "electrolyzer_size_mw"] = np.array(jac[1])
+
+    def compute(self, inputs, outputs):
         electrolyzer_size_mw = float(inputs["electrolyzer_size_mw"][0])
 
         # run hydrogen production cost model - from hopp examples

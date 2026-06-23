@@ -98,7 +98,7 @@ class PerformanceModelBaseClass(om.ExplicitComponent):
         # operational life of the technology if the technology cannot be replaced
         self.add_output("operational_life", val=self.plant_life, units="yr")
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         """
         Computation for the OM component.
 
@@ -146,12 +146,8 @@ class CostModelBaseClass(om.ExplicitComponent):
             units="USD/year",
             desc="Variable operational expenditure",
         )
-        # Define discrete outputs: cost_year
-        self.add_discrete_output(
-            "cost_year", val=self.config.cost_year, desc="Dollar year for costs"
-        )
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         """
         Computation for the OM component.
 
@@ -238,7 +234,7 @@ class ResizeablePerformanceModelBaseClass(PerformanceModelBaseClass):
                 feed_ratio = self.config.max_feedstock_ratio
                 self.add_input("max_feedstock_ratio", val=feed_ratio, units="unitless")
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         """
         Computation for the OM component.
 

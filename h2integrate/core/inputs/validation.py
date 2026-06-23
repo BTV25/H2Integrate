@@ -140,13 +140,10 @@ def load_tech_yaml(finput):
 def load_plant_yaml(finput):
     plant_config = _validate(finput, fschema_plant)
 
-    if int(plant_config["plant"]["simulation"]["n_timesteps"]) != 8760:
-        msg = (
-            "H2Integrate does not currently support simulations that are less than or "
-            "greater than 1-year. Please ensure that "
-            "plant_config['plant']['simulation']['n_timesteps'] is set to 8760."
-        )
-        raise ValueError(msg)
+    # Validation relaxed to allow sub-annual runs for power-only analysis.
+    # Financial outputs (LCOH/LCOE) are not meaningful with n_timesteps < 8760.
+    # if int(plant_config["plant"]["simulation"]["n_timesteps"]) != 8760:
+    #     raise ValueError(...)
     if int(plant_config["plant"]["simulation"]["dt"]) != 3600:
         msg = (
             "H2Integrate does not currently support simulations with a time step that is "

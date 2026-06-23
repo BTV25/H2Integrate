@@ -49,7 +49,7 @@ class BasicElectrolyzerCostModel(ElectrolyzerCostBaseClass):
             desc="Size of the electrolyzer in MW",
         )
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         # unpack inputs
         self.options["plant_config"]
 

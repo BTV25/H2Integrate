@@ -87,7 +87,7 @@ class GenericStorageCostModel(CostModelBaseClass):
             desc="Annual operating cost as a fraction of total system cost",
         )
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         storage_duration_hrs = 0.0
 
         if inputs["max_charge_rate"] > 0:

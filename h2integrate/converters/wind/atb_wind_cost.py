@@ -62,7 +62,7 @@ class ATBWindPlantCostModel(CostModelBaseClass):
             desc="Wind farm rated capacity in kW",
         )
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         capex = self.config.capex_per_kW * inputs["rated_electricity_production"]
         opex = self.config.opex_per_kW_per_year * inputs["rated_electricity_production"]
 

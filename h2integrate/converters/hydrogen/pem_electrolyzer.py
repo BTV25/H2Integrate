@@ -1,6 +1,8 @@
 import math
 
 import numpy as np
+import jax
+import jax.numpy as jnp
 from attrs import field, define
 
 from h2integrate.core.utilities import merge_shared_inputs
@@ -9,6 +11,27 @@ from h2integrate.core.model_baseclasses import ResizeablePerformanceModelBaseCon
 from h2integrate.converters.hydrogen.utilities import size_electrolyzer_for_hydrogen_demand
 from h2integrate.converters.hydrogen.pem_model.run_h2_PEM import run_h2_PEM
 from h2integrate.converters.hydrogen.electrolyzer_baseclass import ElectrolyzerPerformanceBaseClass
+
+jax.config.update("jax_enable_x64", True)
+
+
+def _make_jax_pem_compute(turndown_power_kw, h2_per_kw):
+    """Simple differentiable PEM approximation.
+
+    Below turndown: H2 = 0 (electrolyzer off).
+    Above turndown: H2 = power * h2_per_kw (linear, using the conversion factor
+    measured from the actual run_h2_PEM output).
+
+    h2_per_kw is set in compute() from the actual forward pass, giving a locally
+    accurate first-order approximation of the efficiency at the current operating point.
+    """
+    def compute(electricity_in):
+        return jnp.where(
+            electricity_in >= turndown_power_kw,
+            electricity_in * h2_per_kw,
+            0.0,
+        )
+    return compute
 
 
 @define(kw_only=True)
@@ -94,6 +117,45 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
         self.add_input("max_hydrogen_capacity", val=1000.0, units="kg/h")
         # TODO: add feedstock inputs and consumption outputs
 
+        # Initialise cached quantities used by compute_partials
+        self._h2_per_kw = 1.0 / (39.4 * 1000.0 / 0.67)  # fallback: ~67% HHV efficiency
+        self._turndown_power_kw = self.config.turndown_ratio * self.config.cluster_rating_MW * 1e3
+
+    def setup_partials(self):
+        n_ts = self.options["plant_config"]["plant"]["simulation"]["n_timesteps"]
+        arange = np.arange(n_ts)
+        # Analytic (JAX) partials for the timeseries electricity → hydrogen path
+        for out in ("hydrogen_out", "total_hydrogen_produced", "annual_hydrogen_produced",
+                    "capacity_factor"):
+            self.declare_partials(out, "electricity_in", rows=arange, cols=arange)
+        # FD for scalar sizing variables (not on the critical optimisation path)
+        self.declare_partials("electrolyzer_size_mw", "n_clusters", method="fd")
+        self._n_ts = n_ts
+
+    def compute_partials(self, inputs, partials):
+        electricity_in = jnp.array(inputs["electricity_in"])
+        _fn = _make_jax_pem_compute(
+            turndown_power_kw=self._turndown_power_kw,
+            h2_per_kw=self._h2_per_kw,
+        )
+        jac_diag = jax.vmap(jax.grad(_fn))(electricity_in)
+        jac_np = np.array(jac_diag)
+
+        partials["hydrogen_out", "electricity_in"] = jac_np
+
+        # Aggregate outputs: same Jacobian scaled appropriately
+        n_ts = self._n_ts
+        dt_h = 1.0  # 1 hour timesteps
+        foy = self.fraction_of_year_simulated
+        rated_h2 = self._rated_hydrogen_production if hasattr(self, "_rated_hydrogen_production") else 1.0
+        electrolyzer_size_mw = inputs["n_clusters"][0] * self.config.cluster_rating_MW
+
+        partials["total_hydrogen_produced", "electricity_in"] = jac_np * dt_h
+        partials["annual_hydrogen_produced", "electricity_in"] = jac_np * dt_h / foy
+        # capacity_factor = sum(h2_out) / (rated_h2_production * n_ts)
+        cf_denom = rated_h2 * n_ts if rated_h2 > 0 else 1.0
+        partials["capacity_factor", "electricity_in"] = jac_np / cf_denom
+
     def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
         plant_life = self.options["plant_config"]["plant"]["plant_life"]
         electrolyzer_size_mw = inputs["n_clusters"][0] * self.config.cluster_rating_MW
@@ -160,12 +222,22 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
         # Assuming `h2_results` includes hydrogen and oxygen rates per timestep
         outputs["hydrogen_out"] = H2_Results["Hydrogen Hourly Production [kg/hr]"]
         outputs["total_hydrogen_produced"] = outputs["hydrogen_out"].sum()
+
+        # Cache conversion factor for compute_partials: h2_kg_per_kWh at current operating point
+        elec = inputs["electricity_in"]
+        h2 = outputs["hydrogen_out"]
+        total_elec = float(np.sum(elec))
+        total_h2 = float(np.sum(h2))
+        self._h2_per_kw = total_h2 / total_elec if total_elec > 0 else self._h2_per_kw
+        self._turndown_power_kw = (
+            self.config.turndown_ratio * electrolyzer_actual_capacity_MW * 1e3
+        )
         outputs["efficiency"] = H2_Results["Sim: Average Efficiency [%-HHV]"]
         refurb_schedule = np.zeros(self.plant_life)
         if np.isnan(H2_Results["Time Until Replacement [hrs]"]):
-            refurb_period = 80000 / (24 * 365)
+            refurb_period = int(80000 / (24 * 365))
         else:
-            refurb_period = round(float(H2_Results["Time Until Replacement [hrs]"]) / (24 * 365))
+            refurb_period = int(round(float(H2_Results["Time Until Replacement [hrs]"]) / (24 * 365)))
         refurb_schedule[refurb_period : self.plant_life : refurb_period] = 1
 
         # The replacement_schedule is the fraction of the total capacity that is replaced per year
@@ -183,6 +255,7 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
         outputs["time_until_replacement"] = H2_Results["Time Until Replacement [hrs]"]
 
         outputs["rated_hydrogen_production"] = H2_Results["Rated BOL: H2 Production [kg/hr]"]
+        self._rated_hydrogen_production = float(outputs["rated_hydrogen_production"])
         outputs["electrolyzer_size_mw"] = electrolyzer_actual_capacity_MW
         outputs["capacity_factor"] = H2_Results["Performance Schedules"][
             "Capacity Factor [-]"

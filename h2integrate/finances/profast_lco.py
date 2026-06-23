@@ -109,6 +109,10 @@ class ProFastLCO(ProFastBase):
         # simulate ProFAST
         sol, summary, price_breakdown = run_profast(pf)
 
+        # cache for IFT-based compute_partials
+        self._current_price = float(sol["lco"])
+        self._current_pf = pf
+
         # populate outputs
         # Output names based on naming convention for finance subgroups
         outputs[self.LCO_str] = sol["lco"]

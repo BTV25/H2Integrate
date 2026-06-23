@@ -88,7 +88,7 @@ class ATBBatteryCostModel(CostModelBaseClass):
         self.declare_partials("OpEx", "max_capacity", val=f * e * k_cap)
         self.declare_partials("OpEx", "max_charge_rate", val=f * p * k_rate)
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         storage_duration_hrs = 0.0
 
         # convert the input capacity to units of kW*h

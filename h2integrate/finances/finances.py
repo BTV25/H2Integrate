@@ -47,12 +47,19 @@ class AdjustedCapexOpexComp(om.ExplicitComponent):
         ]
         plant_life = self.plant_life = int(self.options["plant_config"]["plant"]["plant_life"])
 
+        # Store cost_year values from tech configs
+        self.cost_years = {}
+        for tech in tech_configs:
+            cost_params = {
+                **tech_configs[tech].get("model_inputs", {}).get("shared_parameters", {}),
+                **tech_configs[tech].get("model_inputs", {}).get("cost_parameters", {}),
+            }
+            self.cost_years[tech] = int(cost_params.get("cost_year", self.target_dollar_year))
+
         for tech in tech_configs:
             self.add_input(f"capex_{tech}", val=0.0, units="USD")
             self.add_input(f"opex_{tech}", val=0.0, units="USD/year")
             self.add_input(f"varopex_{tech}", val=0.0, shape=plant_life, units="USD/year")
-
-            self.add_discrete_input(f"cost_year_{tech}", val=0, desc="Dollar year for costs")
 
             self.add_output(f"capex_adjusted_{tech}", val=0.0, units="USD")
             self.add_output(f"opex_adjusted_{tech}", val=0.0, units="USD/year")
@@ -73,9 +80,9 @@ class AdjustedCapexOpexComp(om.ExplicitComponent):
             self.declare_partials("total_opex_adjusted", f"opex_{tech}")
             self.declare_partials("total_varopex_adjusted", f"varopex_{tech}", rows=idx, cols=idx)
 
-    def compute_partials(self, inputs, partials, discrete_inputs):
+    def compute_partials(self, inputs, partials):
         for tech in self.options["tech_configs"]:
-            cost_year = int(discrete_inputs[f"cost_year_{tech}"])
+            cost_year = self.cost_years[tech]
             factor = (1 + self.inflation_rate) ** (self.target_dollar_year - cost_year)
             partials[f"capex_adjusted_{tech}", f"capex_{tech}"] = factor
             partials[f"opex_adjusted_{tech}", f"opex_{tech}"] = factor
@@ -84,7 +91,7 @@ class AdjustedCapexOpexComp(om.ExplicitComponent):
             partials["total_opex_adjusted", f"opex_{tech}"] = factor
             partials["total_varopex_adjusted", f"varopex_{tech}"] = factor
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         total_capex_adjusted = 0.0
         total_opex_adjusted = 0.0
         total_varopex_adjusted = np.zeros(self.plant_life)
@@ -92,7 +99,7 @@ class AdjustedCapexOpexComp(om.ExplicitComponent):
             capex = inputs[f"capex_{tech}"][0]
             opex = inputs[f"opex_{tech}"][0]
             varopex = inputs[f"varopex_{tech}"]
-            cost_year = int(discrete_inputs[f"cost_year_{tech}"])
+            cost_year = self.cost_years[tech]
             periods = self.target_dollar_year - cost_year
             adjusted_capex = -npf.fv(self.inflation_rate, periods, 0.0, capex)
             adjusted_opex = -npf.fv(self.inflation_rate, periods, 0.0, opex)

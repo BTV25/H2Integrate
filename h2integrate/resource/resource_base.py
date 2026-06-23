@@ -355,7 +355,7 @@ class ResourceBaseAPIModel(om.ExplicitComponent):
         else:
             raise ValueError("Did not successfully download resource data.")
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         if not self.config.use_fixed_resource_location:
             # update the resource data based on the input latitude and longitude
             data = self.get_data(inputs["latitude"][0], inputs["longitude"][0], first_call=False)

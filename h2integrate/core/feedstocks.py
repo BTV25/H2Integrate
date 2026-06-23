@@ -46,6 +46,14 @@ class FeedstockPerformanceModel(om.ExplicitComponent):
             units=self.config.commodity_rate_units,
         )
 
+    def setup_partials(self):
+        n = self.n_timesteps
+        self.declare_partials(
+            f"{self.config.commodity}_out",
+            f"{self.config.commodity}_capacity",
+            rows=np.arange(n), cols=np.zeros(n, dtype=int), val=1.0,
+        )
+
     def compute(self, inputs, outputs):
         # Generate feedstock array operating at full capacity for the full year
         outputs[f"{self.config.commodity}_out"] = np.full(
@@ -111,7 +119,33 @@ class FeedstockCostModel(CostModelBaseClass):
         # lifetime estimate of item replacements, represented as a fraction of the capacity.
         self.add_output("replacement_schedule", val=0.0, shape=plant_life, units="unitless")
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def setup_partials(self):
+        pl = int(self.options["plant_config"]["plant"]["plant_life"])
+        n_ts = int(self.options["plant_config"]["plant"]["simulation"]["n_timesteps"])
+        c = self.config.commodity
+        rows_dense = np.repeat(np.arange(pl), n_ts)
+        cols_dense = np.tile(np.arange(n_ts), pl)
+        self.declare_partials("VarOpEx", f"{c}_consumed", rows=rows_dense, cols=cols_dense)
+        price_val = np.atleast_1d(self.config.price)
+        if price_val.size == 1:
+            self.declare_partials("VarOpEx", "price",
+                                  rows=np.arange(pl), cols=np.zeros(pl, int))
+        else:
+            self.declare_partials("VarOpEx", "price", rows=rows_dense, cols=cols_dense)
+
+    def compute_partials(self, inputs, partials):
+        c = self.config.commodity
+        pl = int(self.options["plant_config"]["plant"]["plant_life"])
+        price = inputs["price"]
+        consumed = inputs[f"{c}_consumed"]
+        if price.size == 1:
+            partials["VarOpEx", "price"] = np.full(pl, float(np.sum(consumed)))
+            partials["VarOpEx", f"{c}_consumed"] = np.tile(float(price[0]), pl * consumed.size)
+        else:
+            partials["VarOpEx", "price"] = np.tile(consumed, pl)
+            partials["VarOpEx", f"{c}_consumed"] = np.tile(price, pl)
+
+    def compute(self, inputs, outputs):
         price = inputs["price"]
         hourly_consumption = inputs[f"{self.config.commodity}_consumed"]
         cost_per_year = sum(price * hourly_consumption)

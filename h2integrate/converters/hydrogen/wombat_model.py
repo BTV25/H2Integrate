@@ -51,7 +51,6 @@ class WOMBATElectrolyzerModel(ECOElectrolyzerPerformanceModel):
             units="USD/year",
             desc="Variable operational expenditure",
         )
-        self.add_discrete_output("cost_year", val=0, desc="Dollar year for costs")
         self.add_output(
             "percent_hydrogen_lost",
             val=0.0,
@@ -153,5 +152,3 @@ class WOMBATElectrolyzerModel(ECOElectrolyzerPerformanceModel):
         outputs["capacity_factor"] = sim.metrics.capacity_factor(
             which="net", frequency="project", by="electrolyzer"
         ).squeeze()
-
-        discrete_outputs["cost_year"] = self.config.cost_year
