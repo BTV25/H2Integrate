@@ -240,6 +240,10 @@ class ArdWindPlantModel(om.Group):
 
         ard_prob = set_up_ard_model(input_dict=ard_input_dict, root_data_path=ard_data_path)
 
+        # x_turbines_in/y_turbines_in are unconnected inputs in the inner problem;
+        # OpenMDAO's _auto_ivc backs them automatically and SubmodelComp exposes
+        # _auto_ivc-tagged outputs as driveable inputs to the outer problem.
+
         # detect FLOWFarm vs FLORIS and wind resource mode
         modeling_options = ard_input_dict.get("modeling_options", {})
         use_flowfarm = "flowfarm" in modeling_options
@@ -280,21 +284,14 @@ class ArdWindPlantModel(om.Group):
                 "turbine_spacing",
             ]
 
-        # SubmodelComp's analytic total-Jacobian path (approx=False) currently returns
-        # zero gradients through the inner model for reasons not yet diagnosed. As a
-        # workaround, approx_totals=FD on the inner model forces SubmodelComp to use
-        # finite-differences for the total Jacobian, which correctly calls FLOWFarmBatchPower.
-        # Side-effect: 1 FLOWFarm evaluation per DV per gradient step (N_x + N_y = 50 calls).
-        # TODO: remove once the analytic SubmodelComp path is debugged.
-        # ard_prob.model.approx_totals(method="fd", step=50.0)  # disabled for analytic path test
-
         # add ard to the h2i model as a sub-problem
-        # Note: x_turbines and y_turbines are outputs of CartesianLayout (read from config),
-        # not inputs to the problem, so we don't expose them as SubmodelComponent inputs.
-        # x_substations/y_substations remain as inputs for substation placement (if optimized).
+        # SubmodelComp alias ("inner_name", "outer_promoted_name") maps the outer IVC's
+        # x_turbines/y_turbines to the inner x_turbines_in/y_turbines_in.
         subprob_ard = om.SubmodelComp(
             problem=ard_prob,
             inputs=[
+                ("x_turbines_in", "x_turbines"),
+                ("y_turbines_in", "y_turbines"),
                 "x_substations",
                 "y_substations",
             ],
@@ -357,3 +354,4 @@ class ArdWindPlantModel(om.Group):
         cost_year_ivc = om.IndepVarComp()
         cost_year_ivc.add_discrete_output("cost_year", val=cost_year)
         self.add_subsystem("cost_year_src", cost_year_ivc, promotes_outputs=["cost_year"])
+

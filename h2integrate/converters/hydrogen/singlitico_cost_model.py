@@ -17,7 +17,7 @@ def _make_jax_singlitico_compute(location, electrolyzer_capex):
     def compute(x):
         P = x[0] * 1e-3                          # GW
         SF = jnp.where(P < 10.0 / 1e3, -0.21, -0.14)
-        P_cost = jnp.minimum(P, 0.1)            # cap at 100 MW
+        P_cost = jnp.where(P >= 0.1, 0.1, P)   # cap at 100 MW (right-hand convention at boundary)
 
         unit_capex_musd = (
             electrolyzer_capex * (1.0 + 0.33 * loc)
@@ -26,7 +26,7 @@ def _make_jax_singlitico_compute(location, electrolyzer_capex):
         capital_musd = unit_capex_musd * P   # total capital cost [MUSD]
         CapEx = capital_musd * 1e6
 
-        P_opex = jnp.minimum(P, 0.1)
+        P_opex = jnp.where(P >= 0.1, 0.1, P)   # cap at 100 MW (right-hand convention at boundary)
         opex_eq = capital_musd * (1.0 - 0.33 * (1.0 + loc)) * 0.0344 * (P_opex * 1e3) ** -0.155
         opex_neq = 0.04 * capital_musd * 0.33 * (1.0 + loc)
         OpEx = (opex_eq + opex_neq) * 1e6
@@ -114,9 +114,9 @@ class SingliticoCostModel(ElectrolyzerCostBaseClass):
         else:
             SF_elec = -0.14  # scale factor, -0.21 for <10MW, -0.14 for >10MW
 
-        # If electrolyzer capacity is >100MW, fix unit cost to 100MW electrolyzer as economies of
+        # If electrolyzer capacity is >=100MW, fix unit cost to 100MW electrolyzer as economies of
         # scale stop at sizes above this, according to assumption in paper.
-        if P_elec > 100 / 10**3:
+        if P_elec >= 100 / 10**3:
             P_elec_cost_per_unit_calc = 0.1
         else:
             P_elec_cost_per_unit_calc = P_elec
@@ -134,9 +134,9 @@ class SingliticoCostModel(ElectrolyzerCostBaseClass):
         electrolyzer_capital_cost_musd = capex_per_unit * P_elec
 
         # Calculate OpEx for a single electrolyzer
-        # If electrolyzer capacity is >100MW, fix unit cost to 100MW electrolyzer
+        # If electrolyzer capacity is >=100MW, fix unit cost to 100MW electrolyzer
         P_elec_opex = P_elec
-        if P_elec > 100 / 10**3:
+        if P_elec >= 100 / 10**3:
             P_elec_opex = 0.1
 
         # Including material cost for planned and unplanned maintenance, labor cost in central

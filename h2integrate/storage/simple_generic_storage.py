@@ -66,10 +66,13 @@ class SimpleGenericStorage(PerformanceModelBaseClass):
 
     def compute_partials(self, inputs, partials):
         c = self.commodity
-        rated = float(inputs["max_charge_rate"])
+        rated = float(inputs["max_charge_rate"][0])
         denom = rated * self.n_timesteps * (self.dt / 3600)
         total = float(np.sum(inputs[f"{c}_set_point"]))
-        partials["capacity_factor", f"{c}_set_point"] = np.full(self.n_timesteps, 1.0 / denom)
+        # capacity_factor is (plant_life,) — Jacobian is (plant_life, n_ts) dense
+        partials["capacity_factor", f"{c}_set_point"] = np.full(
+            (self.plant_life, self.n_timesteps), 1.0 / denom
+        )
         partials["capacity_factor", "max_charge_rate"] = -total / (rated * denom)
 
     def compute(self, inputs, outputs):

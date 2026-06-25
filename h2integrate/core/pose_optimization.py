@@ -166,7 +166,7 @@ class PoseOptimization:
         if self.config["driver"].get("optimization", {}).get("flag", False):
             opt_options = self.config["driver"]["optimization"]
 
-            if opt_options.get("approx_totals", True):
+            if opt_options.get("approx_totals", False):
                 step_size = self._get_step_size()
 
                 if "step_calc" in opt_options.keys():

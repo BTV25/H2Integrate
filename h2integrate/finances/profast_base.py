@@ -594,13 +594,10 @@ class ProFastBase(om.ExplicitComponent):
     def setup_partials(self):
         # Declare partials only for the inputs that feed into the LCO calculation.
         # Non-LCO outputs (IRR, WACC, etc.) are diagnostic and not used in gradients.
+        # LCO_str is always set by add_model_specific_outputs() called in setup() before
+        # OpenMDAO calls setup_partials(), so no fallback is needed.
         commodity = self.options["commodity_type"]
-        lco_str = getattr(self, "LCO_str", None)
-        if lco_str is None:
-            # LCO_str set in add_model_specific_outputs; fall back to wildcard FD during
-            # the brief window before setup completes
-            self.declare_partials("*", "*", method="fd")
-            return
+        lco_str = self.LCO_str
 
         for tech in self.tech_config:
             self.declare_partials(lco_str, f"capex_adjusted_{tech}")

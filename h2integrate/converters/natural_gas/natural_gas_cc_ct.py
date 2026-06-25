@@ -411,6 +411,41 @@ class NaturalGasCostModel(CostModelBaseClass):
             desc="Plant heat rate",
         )
 
+    def setup_partials(self):
+        n_ts = self.options["plant_config"]["plant"]["simulation"]["n_timesteps"]
+        dt = self.options["plant_config"]["plant"]["simulation"]["dt"]
+        self._dt_h = dt / 3600.0
+        arange = np.arange(n_ts)
+        zeros = np.zeros(n_ts, int)
+
+        # CapEx = capex_per_kw * system_capacity * 1000 — linear in two scalar inputs
+        self.declare_partials("CapEx", "system_capacity")
+        self.declare_partials("CapEx", "capex_per_kw")
+
+        # OpEx = (fixed_opex * system_capacity * 1000) + (variable_opex * sum(elec_out * dt_h))
+        self.declare_partials("OpEx", "system_capacity")
+        self.declare_partials("OpEx", "fixed_opex_per_kw_per_year")
+        self.declare_partials("OpEx", "variable_opex_per_mwh")
+        # d(OpEx)/d(electricity_out[t]) = variable_opex_per_mwh * dt_h (dense row)
+        self.declare_partials("OpEx", "electricity_out", rows=zeros, cols=arange)
+
+    def compute_partials(self, inputs, partials):
+        sc = float(inputs["system_capacity"][0])
+        capex_kw = float(inputs["capex_per_kw"][0])
+        fixed_opex = float(inputs["fixed_opex_per_kw_per_year"][0])
+        var_opex = float(inputs["variable_opex_per_mwh"][0])
+        dt_h = self._dt_h
+        n_ts = inputs["electricity_out"].size
+
+        partials["CapEx", "system_capacity"] = capex_kw * 1000.0
+        partials["CapEx", "capex_per_kw"] = sc * 1000.0
+
+        partials["OpEx", "system_capacity"] = fixed_opex * 1000.0
+        partials["OpEx", "fixed_opex_per_kw_per_year"] = sc * 1000.0
+        partials["OpEx", "variable_opex_per_mwh"] = float(np.sum(inputs["electricity_out"])) * dt_h
+        # d(OpEx)/d(electricity_out[t]) = variable_opex * dt_h for each t
+        partials["OpEx", "electricity_out"] = np.full(n_ts, var_opex * dt_h)
+
     def compute(self, inputs, outputs):
         """
         Compute capital and operating costs for the natural gas plant.

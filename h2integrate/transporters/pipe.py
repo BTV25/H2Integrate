@@ -1,3 +1,4 @@
+import numpy as np
 import openmdao.api as om
 
 
@@ -20,6 +21,7 @@ class PipePerformanceModel(om.ExplicitComponent):
                 "water",
             ],
         )
+        self.options.declare("plant_config", default=None)
 
     def setup(self):
         transport_item = self.options["transport_item"]
@@ -49,6 +51,16 @@ class PipePerformanceModel(om.ExplicitComponent):
             copy_shape=self.input_name,
             units=units,
         )
+
+    def setup_partials(self):
+        plant_config = self.options["plant_config"]
+        if plant_config is not None:
+            n = plant_config["plant"]["simulation"]["n_timesteps"]
+            arange = np.arange(n)
+            self.declare_partials(self.output_name, self.input_name,
+                                  rows=arange, cols=arange, val=1.0)
+        else:
+            self.declare_partials(self.output_name, self.input_name, method="cs")
 
     def compute(self, inputs, outputs):
         outputs[self.output_name] = inputs[self.input_name]
