@@ -138,6 +138,7 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
         # Initialise cached quantities used by compute_partials
         self._h2_per_kw = 1.0 / (39.4 * 1000.0 / 0.67)  # fallback: ~67% HHV efficiency
         self._turndown_power_kw = self.config.turndown_ratio * self.config.cluster_rating_MW * 1e3
+        self._rated_capacity_kw = self.config.cluster_rating_MW * 1e3  # updated in compute()
         self._h2_out_scaled = np.zeros(0)
         self._ann_h2_scaled = np.zeros(0)
         self._cf_scaled = np.zeros(0)
@@ -157,17 +158,30 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
 
     def setup_partials(self):
         n_ts = self.options["plant_config"]["plant"]["simulation"]["n_timesteps"]
+        plant_life = self.options["plant_config"]["plant"]["plant_life"]
         arange = np.arange(n_ts)
         zeros = np.zeros(n_ts, int)
 
         # hydrogen_out is (n_ts,) → diagonal Jacobian
         self.declare_partials("hydrogen_out", "electricity_in", rows=arange, cols=arange)
 
-        # Scalar aggregate outputs → dense row (1 × n_ts)
-        for out in ("total_hydrogen_produced", "annual_hydrogen_produced", "capacity_factor"):
-            self.declare_partials(out, "electricity_in", rows=zeros, cols=arange)
+        # total_hydrogen_produced is scalar → dense row
+        self.declare_partials("total_hydrogen_produced", "electricity_in", rows=zeros, cols=arange)
+
+        # annual_hydrogen_produced and capacity_factor are (plant_life,) → one dense row per year
+        ann_rows = np.repeat(np.arange(plant_life), n_ts)
+        ann_cols = np.tile(arange, plant_life)
+        self.declare_partials("annual_hydrogen_produced", "electricity_in", rows=ann_rows, cols=ann_cols)
+        self.declare_partials("capacity_factor", "electricity_in", rows=ann_rows, cols=ann_cols)
 
         self._n_ts = n_ts
+        self._plant_life = plant_life
+
+    # Hardcoded per-stack power rating in PEM_H2_Clusters.external_power_supply, which
+    # clips input power to n_total_stacks * _STACK_RATING_KW before it ever reaches the
+    # electrochemical model. Must mirror that cap here so the analytic Jacobian goes to
+    # zero at saturation like the true (clipped) forward model does.
+    _STACK_RATING_KW = 1000.0
 
     def compute_partials(self, inputs, partials, discrete_inputs=None):
         # --- electricity_in: JAX diagonal Jacobian ---
@@ -178,20 +192,26 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
         # at those timesteps (relative step × 0 = 0), so analytic must match.
         n = float(self._n_total_stacks)
         elec = inputs["electricity_in"]
-        cluster_min_kw = self.config.turndown_ratio * self.config.cluster_rating_MW * 1e3
         power_per_stack = jnp.array(elec / n, dtype=jnp.float64)
-        on_mask = (np.array(power_per_stack) >= cluster_min_kw).astype(float)
-        jac_diag = np.array(jax.vmap(jax.grad(self._jax_h2_fn))(power_per_stack)) * self._scale * on_mask
+        # Use forward-pass output to mask off-timesteps: if run_h2_PEM produced no
+        # hydrogen at timestep t, FD also gives 0, so analytic must match.
+        on_mask = (self._h2_out_scaled > 0).astype(float) if len(self._h2_out_scaled) == len(elec) else np.ones(len(elec))
+        # Zero out saturated timesteps: external_power_supply() clips power_per_stack at
+        # _STACK_RATING_KW, so beyond that point hydrogen_out no longer responds to
+        # electricity_in and FD correctly gives 0 there too.
+        sat_mask = (np.asarray(power_per_stack) < self._STACK_RATING_KW).astype(float)
+        jac_diag = (
+            np.array(jax.vmap(jax.grad(self._jax_h2_fn))(power_per_stack))
+            * self._scale * on_mask * sat_mask
+        )
 
         partials["hydrogen_out", "electricity_in"] = jac_diag
-
-        n_ts = self._n_ts
-        rated_h2 = getattr(self, "_rated_hydrogen_production", 1.0)
-
         partials["total_hydrogen_produced", "electricity_in"] = jac_diag
-        partials["annual_hydrogen_produced", "electricity_in"] = jac_diag
-        cf_denom = rated_h2 * n_ts if rated_h2 > 0 else 1.0
-        partials["capacity_factor", "electricity_in"] = jac_diag / cf_denom
+
+        rated_h2 = getattr(self, "_rated_hydrogen_production", 1.0)
+        cf_denom = rated_h2 * self._n_ts if rated_h2 > 0 else 1.0
+        partials["annual_hydrogen_produced", "electricity_in"] = np.tile(jac_diag, self._plant_life)
+        partials["capacity_factor", "electricity_in"] = np.tile(jac_diag / cf_denom, self._plant_life)
 
     def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
         plant_life = self.options["plant_config"]["plant"]["plant_life"]
@@ -236,6 +256,7 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
 
         electrolyzer_actual_capacity_MW = n_pem_clusters * self.config.cluster_rating_MW
         self._n_total_stacks = n_pem_clusters * int(round(self.config.cluster_rating_MW))
+        self._rated_capacity_kw = electrolyzer_actual_capacity_MW * 1e3
         pem_param_dict = {
             "eol_eff_percent_loss": self.config.eol_eff_percent_loss,
             "uptime_hours_until_eol": self.config.uptime_hours_until_eol,
