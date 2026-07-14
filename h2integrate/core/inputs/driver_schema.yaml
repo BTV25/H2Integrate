@@ -21,6 +21,10 @@ properties:
         type: boolean
         description: Whether to create OpenMDAO reports (N2 diagrams, etc.)
         default: true
+      create_xdsm:
+        type: boolean
+        description: Whether to create the system XDSM diagram (runs a latex subprocess)
+        default: true
   driver:
     type: object
     properties:

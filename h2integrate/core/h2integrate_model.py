@@ -1211,7 +1211,8 @@ class H2IntegrateModel:
                     f"{dispatching_tech_name}.dispatch_block_rule_function_{tech_name}",
                 )
 
-        if (pyxdsm is not None) and (len(technology_interconnections) > 0):
+        create_xdsm = self.driver_config.get("general", {}).get("create_xdsm", True)
+        if create_xdsm and (pyxdsm is not None) and (len(technology_interconnections) > 0):
             try:
                 create_xdsm_from_config(self.plant_config)
             except FileNotFoundError as e:
