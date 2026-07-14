@@ -592,7 +592,14 @@ class ProFastBase(om.ExplicitComponent):
         self.coproduct_cost_settings = ProFASTDefaultCoproduct.from_dict(coproduct_cost_params)
 
     def setup_partials(self):
-        self.declare_partials("*", "*", method="fd", step=1e-6, step_calc="rel")
+        # Optional list of input-name patterns to FD against; anything not listed is
+        # treated as having zero partials. Each declared scalar costs one full ProFAST
+        # evaluation per linearization, so restricting this to the inputs that actually
+        # vary in a given model can substantially reduce gradient time.
+        fd_wrt = self.options["plant_config"]["finance_parameters"]["model_inputs"].get(
+            "fd_partials_wrt", ["*"]
+        )
+        self.declare_partials("*", fd_wrt, method="fd", step=1e-6, step_calc="rel")
 
     def populate_profast(self, inputs):
         """Populate and configure the ProFAST financial model for analysis.
