@@ -454,8 +454,12 @@ class DemandOpenLoopStorageController(DemandOpenLoopControlBase):
         self.declare_partials("storage_duration", ["max_charge_rate", "max_capacity"])
 
         fixed_mdr = None if cfg.charge_equals_discharge else float(cfg.max_discharge_rate)
+        # jacfwd, not jacobian/jacrev: outputs (4x8760+1 rows) outnumber inputs
+        # (2x8760+2 cols), so forward mode halves the batch width through the scan
+        # and avoids the scan-transpose residual traffic (measured 3.2x faster,
+        # identical Jacobian; see research notes 2026-07-14 Session 7)
         self._jax_jac = jax.jit(
-            jax.jacobian(
+            jax.jacfwd(
                 _make_jax_compute(
                     cfg.max_charge_fraction,
                     cfg.min_charge_fraction,
@@ -493,7 +497,7 @@ class DemandOpenLoopStorageController(DemandOpenLoopControlBase):
 
         for i_out, out in enumerate(out_names):
             for i_in, inp in enumerate(in_names):
-                partials[out, inp] = np.array(jac[i_out][i_in])
+                partials[out, inp] = np.asarray(jac[i_out][i_in])
 
         # storage_duration = max_capacity / max_discharge_rate (analytic)
         mc = float(inputs["max_capacity"][0])
