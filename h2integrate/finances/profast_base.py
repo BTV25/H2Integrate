@@ -592,71 +592,7 @@ class ProFastBase(om.ExplicitComponent):
         self.coproduct_cost_settings = ProFASTDefaultCoproduct.from_dict(coproduct_cost_params)
 
     def setup_partials(self):
-        # Declare partials only for the inputs that feed into the LCO calculation.
-        # Non-LCO outputs (IRR, WACC, etc.) are diagnostic and not used in gradients.
-        # LCO_str is always set by add_model_specific_outputs() called in setup() before
-        # OpenMDAO calls setup_partials(), so no fallback is needed.
-        commodity = self.options["commodity_type"]
-        lco_str = self.LCO_str
-
-        for tech in self.tech_config:
-            self.declare_partials(lco_str, f"capex_adjusted_{tech}")
-            self.declare_partials(lco_str, f"opex_adjusted_{tech}")
-            self.declare_partials(lco_str, f"varopex_adjusted_{tech}")
-        self.declare_partials(lco_str, f"rated_{commodity}_production")
-        self.declare_partials(lco_str, "capacity_factor")
-
-        # Initialise cache so compute_partials won't crash before first compute()
-        self._current_price = 1.0
-        self._current_pf = None
-
-    def compute_partials(self, inputs, partials):
-        if self._current_pf is None:
-            return
-
-        lco_str = self.LCO_str
-        price = self._current_price
-        pf0 = self._current_pf
-
-        # d(NPV)/d(price): centered FD on cash_flow (cheap single evaluation)
-        dp = 1e-4 * max(1.0, abs(price))
-        d_npv_d_price = (pf0.cash_flow(price + dp) - pf0.cash_flow(price - dp)) / (2.0 * dp)
-        if d_npv_d_price == 0.0:
-            return
-
-        # For each declared input: perturb, rebuild pf, call cash_flow at FIXED price
-        commodity = self.options["commodity_type"]
-        relevant = (
-            [f"capex_adjusted_{t}" for t in self.tech_config]
-            + [f"opex_adjusted_{t}" for t in self.tech_config]
-            + [f"varopex_adjusted_{t}" for t in self.tech_config]
-            + [f"rated_{commodity}_production", "capacity_factor"]
-        )
-
-        inputs_dict = {k: np.array(inputs[k]) for k in inputs}
-
-        for inp_name in relevant:
-            val = inputs_dict[inp_name].copy()
-            d_npv = np.zeros_like(val, dtype=float)
-            # Relative step; floor at 1.0 to handle near-zero values
-            dx = 1e-4 * max(1.0, float(np.max(np.abs(val))))
-
-            for i in range(val.size):
-                hi = {k: v.copy() for k, v in inputs_dict.items()}
-                hi[inp_name] = val.copy()
-                hi[inp_name].flat[i] += dx
-                pf_hi = self.populate_profast(hi)
-                npv_hi = pf_hi.cash_flow(price)
-
-                lo = {k: v.copy() for k, v in inputs_dict.items()}
-                lo[inp_name] = val.copy()
-                lo[inp_name].flat[i] -= dx
-                pf_lo = self.populate_profast(lo)
-                npv_lo = pf_lo.cash_flow(price)
-
-                d_npv.flat[i] = (npv_hi - npv_lo) / (2.0 * dx)
-
-            partials[lco_str, inp_name] = -d_npv / d_npv_d_price
+        self.declare_partials("*", "*", method="fd", step=1e-6, step_calc="rel")
 
     def populate_profast(self, inputs):
         """Populate and configure the ProFAST financial model for analysis.
