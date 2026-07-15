@@ -124,6 +124,12 @@ class DemandOpenLoopStorageControllerConfig(DemandOpenLoopControlBaseConfig):
             discharging the storage, represented as a decimal between 0 and 1 (e.g., 0.81 for
             81% efficiency). Optional if `charge_efficiency` and `discharge_efficiency` are
             provided.
+        matrix_free (bool, optional): If True, provide derivatives matrix-free via
+            `compute_jacvec_product` (one JVP/VJP through the time-step scan per linear-solve
+            product) instead of assembling the dense timeseries Jacobian with `jax.jacfwd`.
+            Much faster inside gradient-based optimization, but `check_partials` on this
+            component then runs directional derivative checks only. Defaults to False
+            (dense Jacobian, unchanged behavior).
     """
 
     max_capacity: float = field()
@@ -136,6 +142,7 @@ class DemandOpenLoopStorageControllerConfig(DemandOpenLoopControlBaseConfig):
     charge_efficiency: float | None = field(default=None, validator=range_val_or_none(0, 1))
     discharge_efficiency: float | None = field(default=None, validator=range_val_or_none(0, 1))
     round_trip_efficiency: float | None = field(default=None, validator=range_val_or_none(0, 1))
+    matrix_free: bool = field(default=False)
 
     def __attrs_post_init__(self):
         """
@@ -439,6 +446,36 @@ class DemandOpenLoopStorageController(DemandOpenLoopControlBase):
         commodity = self.config.commodity
         cfg = self.config
 
+        fixed_mdr = None if cfg.charge_equals_discharge else float(cfg.max_discharge_rate)
+        jax_fn = _make_jax_compute(
+            cfg.max_charge_fraction,
+            cfg.min_charge_fraction,
+            cfg.init_charge_fraction,
+            float(cfg.charge_efficiency),
+            float(cfg.discharge_efficiency),
+            cfg.charge_equals_discharge,
+            fixed_mdr,
+        )
+
+        # OpenMDAO auto-detects matrix_free from the compute_jacvec_product override;
+        # gate it per-instance on the config flag so the default stays the dense
+        # Jacobian path (explicit assignment wins over the auto-detection).
+        self.matrix_free = bool(cfg.matrix_free)
+
+        if self.matrix_free:
+            # No declared partials: linear products come from one JVP/VJP through the
+            # scan (0.03-0.05 s) instead of a full 8760^2-blocked jacfwd (~4 s) plus
+            # dense subjac copies. check_partials must run directional on matrix-free
+            # components (full-J reconstruction is one JVP per input scalar, ~12 min).
+            self.set_check_partial_options(wrt="*", directional=True)
+            self._jax_jvp = jax.jit(
+                lambda primals, tangents: jax.jvp(jax_fn, primals, tangents)[1]
+            )
+            self._jax_vjp = jax.jit(
+                lambda primals, cotangents: jax.vjp(jax_fn, *primals)[1](cotangents)
+            )
+            return
+
         ts_out = [
             f"{commodity}_set_point",
             f"{commodity}_soc",
@@ -453,25 +490,11 @@ class DemandOpenLoopStorageController(DemandOpenLoopControlBase):
                 self.declare_partials(out, inp)
         self.declare_partials("storage_duration", ["max_charge_rate", "max_capacity"])
 
-        fixed_mdr = None if cfg.charge_equals_discharge else float(cfg.max_discharge_rate)
         # jacfwd, not jacobian/jacrev: outputs (4x8760+1 rows) outnumber inputs
         # (2x8760+2 cols), so forward mode halves the batch width through the scan
         # and avoids the scan-transpose residual traffic (measured 3.2x faster,
         # identical Jacobian; see research notes 2026-07-14 Session 7)
-        self._jax_jac = jax.jit(
-            jax.jacfwd(
-                _make_jax_compute(
-                    cfg.max_charge_fraction,
-                    cfg.min_charge_fraction,
-                    cfg.init_charge_fraction,
-                    float(cfg.charge_efficiency),
-                    float(cfg.discharge_efficiency),
-                    cfg.charge_equals_discharge,
-                    fixed_mdr,
-                ),
-                argnums=(0, 1, 2, 3),
-            )
-        )
+        self._jax_jac = jax.jit(jax.jacfwd(jax_fn, argnums=(0, 1, 2, 3)))
 
     def compute_partials(self, inputs, partials):
         commodity = self.config.commodity
@@ -500,10 +523,87 @@ class DemandOpenLoopStorageController(DemandOpenLoopControlBase):
                 partials[out, inp] = np.asarray(jac[i_out][i_in])
 
         # storage_duration = max_capacity / max_discharge_rate (analytic)
+        d_mc, d_mcr = self._storage_duration_partials(inputs)
+        partials["storage_duration", "max_capacity"] = d_mc
+        partials["storage_duration", "max_charge_rate"] = d_mcr
+
+    def _storage_duration_partials(self, inputs):
+        # storage_duration = max_capacity / max_discharge_rate (analytic)
         mc = float(inputs["max_capacity"][0])
         mcr = float(inputs["max_charge_rate"][0])
         mdr = mcr if self.config.charge_equals_discharge else float(self.config.max_discharge_rate)
-        partials["storage_duration", "max_capacity"] = 1.0 / mdr
-        partials["storage_duration", "max_charge_rate"] = (
-            -mc / mdr**2 if self.config.charge_equals_discharge else 0.0
+        d_mcr = -mc / mdr**2 if self.config.charge_equals_discharge else 0.0
+        return 1.0 / mdr, d_mcr
+
+    def compute_jacvec_product(self, inputs, d_inputs, d_outputs, mode):
+        """Matrix-free linear products: one JVP (fwd) or VJP (rev) through the scan.
+
+        Only used when the `matrix_free` config flag is True (self.matrix_free gates
+        OpenMDAO's dispatch); mathematically identical to the dense Jacobian path.
+        `storage_duration` is not an output of the JAX scan function, so its two
+        analytic scalar partials are applied by hand in both modes.
+        """
+        commodity = self.config.commodity
+        in_ts = [f"{commodity}_in", f"{commodity}_demand"]
+        out_names = [
+            f"{commodity}_set_point",
+            f"{commodity}_soc",
+            f"{commodity}_unused_commodity",
+            f"{commodity}_unmet_demand",
+            f"total_{commodity}_unmet_demand",
+        ]
+
+        primals = (
+            jnp.asarray(inputs[in_ts[0]]),
+            jnp.asarray(inputs[in_ts[1]]),
+            jnp.asarray(inputs["max_charge_rate"][0]),
+            jnp.asarray(inputs["max_capacity"][0]),
         )
+        n = primals[0].shape[0]
+        dt = primals[0].dtype
+        d_sd_d_mc, d_sd_d_mcr = self._storage_duration_partials(inputs)
+
+        if mode == "fwd":
+            tangents = (
+                jnp.asarray(d_inputs[in_ts[0]], dt) if in_ts[0] in d_inputs else jnp.zeros(n, dt),
+                jnp.asarray(d_inputs[in_ts[1]], dt) if in_ts[1] in d_inputs else jnp.zeros(n, dt),
+                jnp.asarray(
+                    d_inputs["max_charge_rate"][0] if "max_charge_rate" in d_inputs else 0.0, dt
+                ),
+                jnp.asarray(
+                    d_inputs["max_capacity"][0] if "max_capacity" in d_inputs else 0.0, dt
+                ),
+            )
+            d_out = self._jax_jvp(primals, tangents)
+            for name, dval in zip(out_names, d_out):
+                if name in d_outputs:
+                    d_outputs[name] += np.asarray(dval)
+            if "storage_duration" in d_outputs:
+                if "max_capacity" in d_inputs:
+                    d_outputs["storage_duration"] += d_sd_d_mc * d_inputs["max_capacity"][0]
+                if "max_charge_rate" in d_inputs:
+                    d_outputs["storage_duration"] += d_sd_d_mcr * d_inputs["max_charge_rate"][0]
+        else:
+            cotangents = tuple(
+                jnp.asarray(d_outputs[name], dt) if name in d_outputs else jnp.zeros(n, dt)
+                for name in out_names[:4]
+            ) + (
+                jnp.asarray(
+                    d_outputs[out_names[4]][0] if out_names[4] in d_outputs else 0.0, dt
+                ),
+            )
+            d_in = self._jax_vjp(primals, cotangents)
+            if in_ts[0] in d_inputs:
+                d_inputs[in_ts[0]] += np.asarray(d_in[0])
+            if in_ts[1] in d_inputs:
+                d_inputs[in_ts[1]] += np.asarray(d_in[1])
+            if "max_charge_rate" in d_inputs:
+                d_inputs["max_charge_rate"] += float(d_in[2])
+            if "max_capacity" in d_inputs:
+                d_inputs["max_capacity"] += float(d_in[3])
+            if "storage_duration" in d_outputs:
+                d_sd = float(d_outputs["storage_duration"][0])
+                if "max_capacity" in d_inputs:
+                    d_inputs["max_capacity"] += d_sd_d_mc * d_sd
+                if "max_charge_rate" in d_inputs:
+                    d_inputs["max_charge_rate"] += d_sd_d_mcr * d_sd
