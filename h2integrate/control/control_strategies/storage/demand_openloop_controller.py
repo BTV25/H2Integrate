@@ -393,7 +393,9 @@ class DemandOpenLoopStorageController(DemandOpenLoopControlBase):
                     discharge_needed, available_discharge, max_discharge_rate / discharge_efficiency
                 )
 
-                soc -= discharge / max_capacity  # soc is a ratio with value between 0 and 1
+                # discharge is always 0 when max_capacity == 0 (available_discharge == 0),
+                # so guard the division to support "battery removed" (zero-capacity) points.
+                soc -= discharge / max_capacity if max_capacity > 0 else 0.0
                 # output is as observed outside the storage, so we need to adjust `discharge` by
                 # applying `discharge_efficiency`.
                 output_array[t] = input_flow + discharge * discharge_efficiency
@@ -409,7 +411,9 @@ class DemandOpenLoopStorageController(DemandOpenLoopControlBase):
                     min(unused_input, available_charge / charge_efficiency, max_charge_rate)
                     * charge_efficiency
                 )
-                soc += charge / max_capacity  # soc is a ratio with value between 0 and 1
+                # charge is always 0 when max_capacity == 0 (available_charge == 0), so
+                # guard the division to support "battery removed" (zero-capacity) points.
+                soc += charge / max_capacity if max_capacity > 0 else 0.0
                 output_array[t] = demand_t
 
             # Ensure SOC stays within bounds
@@ -439,8 +443,9 @@ class DemandOpenLoopStorageController(DemandOpenLoopControlBase):
         # Calculate and return the total unmet demand over the simulation period
         outputs[f"total_{commodity}_unmet_demand"] = np.sum(unmet_demand_array)
 
-        # Output the storage duration in hours
-        outputs["storage_duration"] = max_capacity / max_discharge_rate
+        # Output the storage duration in hours (0 when the battery is removed, i.e.
+        # max_discharge_rate == 0, matching ATBBatteryCostModel's zero-rate guard)
+        outputs["storage_duration"] = max_capacity / max_discharge_rate if max_discharge_rate > 0 else 0.0
 
     def setup_partials(self):
         commodity = self.config.commodity

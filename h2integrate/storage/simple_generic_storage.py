@@ -93,4 +93,10 @@ class SimpleGenericStorage(PerformanceModelBaseClass):
             outputs[f"rated_{self.commodity}_production"] * self.n_timesteps * (self.dt / 3600)
         )
 
-        outputs["capacity_factor"] = outputs[f"total_{self.commodity}_produced"] / rated_production
+        # rated_production == 0 when max_charge_rate == 0 (battery/storage removed);
+        # capacity_factor is undefined there, so define it as 0 rather than dividing.
+        outputs["capacity_factor"] = np.where(
+            rated_production > 0,
+            outputs[f"total_{self.commodity}_produced"] / np.where(rated_production > 0, rated_production, 1.0),
+            0.0,
+        )
