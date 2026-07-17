@@ -177,13 +177,28 @@ class WindArdCostCompatibilityComponent(CostModelBaseClass):
 
         self.add_input("ard_CapEx", val=0, units="USD")
         self.add_input("ard_OpEx", val=0.0, units="USD/year")
+        self.add_input("total_length_cables", val=0.0, units="m")
+
+        # Literature default for onshore 34.5 kV underground collection cable, fully
+        # installed (material + trench + labor); scaled down from NREL/CP-500-41135's
+        # submarine collection-cable material costs ($152-731/m, 2006$) since that
+        # report notes unburied/onshore installation costs less than submarine burial.
+        # Override in tech_config.yaml wind.model_inputs.cable_cost_per_meter if a
+        # site-specific quote is available. Kept outside cost_parameters since
+        # CostModelBaseConfig strictly validates that dict's keys.
+        self.cable_cost_per_meter = self.options["tech_config"]["model_inputs"].get(
+            "cable_cost_per_meter", 120.0
+        )
 
     def setup_partials(self):
         self.declare_partials("CapEx", "ard_CapEx", val=1.0)
+        self.declare_partials("CapEx", "total_length_cables", val=self.cable_cost_per_meter)
         self.declare_partials("OpEx", "ard_OpEx", val=1.0)
 
     def compute(self, inputs, outputs):
-        outputs["CapEx"] = inputs["ard_CapEx"]
+        outputs["CapEx"] = inputs["ard_CapEx"] + self.cable_cost_per_meter * inputs[
+            "total_length_cables"
+        ]
         outputs["OpEx"] = inputs["ard_OpEx"]
 
 
@@ -266,6 +281,7 @@ class ArdWindPlantModel(om.Group):
                 ("opex.opex", "ard_OpEx"),
                 "boundary_distances",
                 "turbine_spacing",
+                "total_length_cables",
             ]
         elif use_flowfarm:
             subprob_outputs = [
@@ -274,6 +290,7 @@ class ArdWindPlantModel(om.Group):
                 ("opex.opex", "ard_OpEx"),
                 "boundary_distances",
                 "turbine_spacing",
+                "total_length_cables",
             ]
         else:
             subprob_outputs = [
@@ -282,6 +299,7 @@ class ArdWindPlantModel(om.Group):
                 ("opex.opex", "ard_OpEx"),
                 "boundary_distances",
                 "turbine_spacing",
+                "total_length_cables",
             ]
 
         # add ard to the h2i model as a sub-problem
