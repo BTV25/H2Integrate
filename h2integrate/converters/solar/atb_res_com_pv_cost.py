@@ -44,7 +44,7 @@ class ATBResComPVCostModel(CostModelBaseClass):
             desc="PV rated capacity in DC",
         )
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         capacity = inputs["system_capacity_DC"][0]
         capex = self.config.capex_per_kWdc * capacity
         opex = self.config.opex_per_kWdc_per_year * capacity

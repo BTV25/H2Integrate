@@ -384,7 +384,7 @@ class ElectricArcFurnacePlantBaseCostComponent(CostModelBaseClass):
 
         return coeff_df
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         # Calculate the capital cost for the item
         dollar_year = self.coeff_df.loc["Dollar Year", "Value"].astype(int)
 

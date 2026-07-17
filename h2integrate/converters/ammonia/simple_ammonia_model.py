@@ -190,7 +190,7 @@ class SimpleAmmoniaCostModel(CostModelBaseClass):
         )
         self.add_output("credits_byproduct", val=0.0, units="USD", desc="Credits from byproducts")
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         # Prepare config object
         config = self.config
 

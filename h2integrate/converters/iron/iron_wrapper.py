@@ -102,7 +102,7 @@ class IronComponent(CostModelBaseClass):
         self.add_output("annual_iron_produced", val=0.0, shape=plant_life, units="kg/year")
         self.add_output("LCOI", val=0.0, units="USD/kg")
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         # Parse in values from config
         mine_site = self.config.ROM_iron_site_name
         ore_type = self.config.iron_ore_product_selection

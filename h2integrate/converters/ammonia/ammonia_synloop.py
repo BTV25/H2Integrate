@@ -479,7 +479,7 @@ class AmmoniaSynLoopCostModel(CostModelBaseClass):
             "maintenance_cost", val=0.0, units="USD/year", desc="Annual maintenance cost"
         )
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         ##---Scaling Ratios---
 
         # Get config values

@@ -148,7 +148,7 @@ class QuinnNuclearCostModel(CostModelBaseClass):
             desc="Hourly electricity output from performance model",
         )
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         capex_per_kw = self.config.capex_per_kw
         fixed_opex_per_kw_year = self.config.fixed_opex_per_kw_year
         variable_opex_per_mwh = self.config.variable_opex_per_mwh

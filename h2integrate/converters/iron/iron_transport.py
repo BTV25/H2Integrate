@@ -196,7 +196,7 @@ class IronTransportCostComponent(CostModelBaseClass):
         self.add_output("iron_transport_cost", val=0.0, units="USD/t")
         self.add_output("ore_profit_margin", val=0.0, units="USD/t")
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         water_coeff_dict = load_top_down_coeffs(
             ["Barge Shipping Cost"], cost_year=self.config.cost_year
         )

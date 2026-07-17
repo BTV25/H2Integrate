@@ -214,7 +214,7 @@ class HumbertStinnEwinCostComponent(CostModelBaseClass):
         self.add_output("ore_opex", val=0.0, units="USD/year")
         self.add_output("elec_opex", val=0.0, units="USD/year")
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         # Parse inputs for Stinn Capex model (doi.org/10.1149/2.F06202IF)
         T = inputs["electrolysis_temp"]
         z = inputs["electron_moles"]

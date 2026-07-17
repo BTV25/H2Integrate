@@ -256,7 +256,7 @@ class GridCostModel(CostModelBaseClass):
                 desc="Price to sell electricity to grid",
             )
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         interconnection_size = inputs["interconnection_size"]
 
         # Capital costs based on interconnection size

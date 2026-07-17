@@ -299,7 +299,7 @@ class SteamMethaneReformerCostModel(CostModelBaseClass):
             desc="Variable operating expenses per unit generation",
         )
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         """
         Compute capital and operating costs for the hydrogen SMR plant.
         """

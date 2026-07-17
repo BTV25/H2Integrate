@@ -313,7 +313,7 @@ class OAECostModel(MarineCarbonCaptureCostBaseClass):
             desc="Mass of RCA tumbler slurry produced (grams)",
         )
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         costs = echem_oae.OAECosts(
             mass_product=inputs["mass_sellable_product"][0],
             value_product=inputs["value_products"][0],
@@ -430,7 +430,7 @@ class OAECostAndFinancialModel(MarineCarbonCaptureCostBaseClass):
             desc="Carbon credit value required to achieve NPV of zero (USD/tCO2)",
         )
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         annual_energy_cost_usd_yr = inputs["LCOE"] * (
             inputs["annual_energy"] - (sum(inputs["unused_energy"]) / 1000)  # Convert W to kW
         )  # remove unused power from the annual energy cost only used power considered

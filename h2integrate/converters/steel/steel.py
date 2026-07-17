@@ -96,7 +96,7 @@ class SteelCostAndFinancialModel(SteelCostBaseClass):
         )  # TODO: update with rated_steel_production
         self.add_output("LCOS", val=0.0, units="USD/t")
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         # Update config with runtime inputs
         self.config.lcoh = inputs["LCOH"]
         if inputs["electricity_cost"] > 0:

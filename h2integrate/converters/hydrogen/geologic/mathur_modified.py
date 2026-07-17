@@ -191,7 +191,7 @@ class GeoH2SubsurfaceCostModel(GeoH2SubsurfaceCostBaseClass):
         self.add_input("preprod_time", units="month", val=self.config.preprod_time)
         self.add_input("as_spent_ratio", units=None, val=self.config.as_spent_ratio)
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         # Get cost years
         cost_year = self.config.cost_year
 

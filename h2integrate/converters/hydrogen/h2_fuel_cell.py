@@ -173,7 +173,7 @@ class H2FuelCellCostModel(CostModelBaseClass):
             desc="Fixed operating expenses per unit capacity per year",
         )
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         """
         Compute capital and fixed operating costs for the fuel cell system.
 

@@ -120,7 +120,7 @@ class MCHTOLStorageCostModel(CostModelBaseClass):
         """
         return b0 + (b1 * self.Hc) + (b2 * self.Dc) + (b3 * self.Ms) + b4 * self.As
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         # convert charge rate to kg/d
         storage_max_fill_rate_tpd = units.convert_units(
             inputs["max_charge_rate"], f"{self.config.commodity_units}", "t/d"

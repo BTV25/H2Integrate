@@ -115,7 +115,7 @@ class RunOfRiverHydroCostModel(CostModelBaseClass):
 
         super().setup()
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         capex_kw = self.config.capital_cost_usd_per_kw
         total_capacity_kw = self.config.plant_capacity_mw * 1e3
 

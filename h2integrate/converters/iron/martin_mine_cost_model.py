@@ -171,7 +171,7 @@ class MartinIronMineCostComponent(CostModelBaseClass):
 
         return coeff_df
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         ref_Oreproduced = self.coeff_df[self.coeff_df["Name"] == "Ore pellets produced"][
             "Value"
         ].values

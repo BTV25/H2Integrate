@@ -293,7 +293,7 @@ class SimpleASUCostModel(CostModelBaseClass):
         self.add_input("ASU_capacity_kW", val=0.0, units="kW")
         self.add_input("rated_nitrogen_production", val=0.0, units="kg/h")
 
-    def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
+    def compute(self, inputs, outputs):
         # Get config values
         capex_k, capex_based_unit = make_cost_unit_multiplier(self.config.capex_unit)
         unit_capex = self.config.capex_usd_per_unit * capex_k
