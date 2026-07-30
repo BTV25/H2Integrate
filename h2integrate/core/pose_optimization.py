@@ -261,6 +261,22 @@ class PoseOptimization:
                     )
                     if "time_limit" in opt_options:
                         opt_prob.driver.opt_settings["Time limit"] = int(opt_options["time_limit"])
+                    if "function_precision" in opt_options:
+                        opt_prob.driver.opt_settings["Function precision"] = float(
+                            opt_options["function_precision"]
+                        )
+                    if "hessian_frequency" in opt_options:
+                        opt_prob.driver.opt_settings["Hessian frequency"] = int(
+                            opt_options["hessian_frequency"]
+                        )
+                    if "scale_option" in opt_options:
+                        opt_prob.driver.opt_settings["Scale option"] = int(
+                            opt_options["scale_option"]
+                        )
+                    if "major_step_limit" in opt_options:
+                        opt_prob.driver.opt_settings["Major step limit"] = float(
+                            opt_options["major_step_limit"]
+                        )
                     opt_prob.driver.opt_settings["Summary file"] = (
                         Path(folder_output) / "SNOPT_Summary_file.txt"
                     )

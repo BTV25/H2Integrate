@@ -571,7 +571,14 @@ class PEM_H2_Clusters:
         # TODO: remove all other function calls to self.output_dict['BOL Efficiency Curve Info']
         # this should be done differntly
         # power_in_signal=np.arange(0.1,1.1,0.1)*self.stack_rating_kW
-        power_in_signal = np.arange(self.turndown_ratio, 1.1, 0.1) * self.stack_rating_kW
+        # np.arange's float step accumulation isn't guaranteed to land exactly on 1.0*rating
+        # (it happens to for turndown_ratio=0.1, not in general) -- find_eol_voltage_val and
+        # the I_max lookup below both find the rated-power row via exact equality, so the
+        # rated point is appended explicitly rather than relying on arange to hit it.
+        power_in_signal = np.append(
+            np.arange(self.turndown_ratio, 1.0, 0.1) * self.stack_rating_kW,
+            self.stack_rating_kW,
+        )
         stack_I = calc_current((power_in_signal, self.T_C), *self.curve_coeff)
         stack_V = self.cell_design(self.T_C, stack_I)
         power_used_signal = (stack_I * stack_V * self.N_cells) / 1000
