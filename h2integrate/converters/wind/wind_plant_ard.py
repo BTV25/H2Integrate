@@ -8,6 +8,13 @@ try:
 except ModuleNotFoundError:
     set_up_ard_model = None
 
+try:
+    from ard.farm_aero.surrogate import SurrogateFarmPower
+    from ard.cost.surrogate_cost import SurrogateWindCost
+except ModuleNotFoundError:
+    SurrogateFarmPower = None
+    SurrogateWindCost = None
+
 from h2integrate.core.utilities import BaseConfig, merge_shared_inputs
 from h2integrate.core.model_baseclasses import (
     CostModelBaseClass,
@@ -115,14 +122,20 @@ class WindArdPerformanceCompatibilityComponent(PerformanceModelBaseClass):
         super().setup()
 
         self.hours_per_year = 8760
-        self.n_turbines = self.config.ard_system["modeling_options"]["layout"]["N_turbines"]
+        n_turbines_init = self.config.ard_system["modeling_options"]["layout"]["N_turbines"]
         turbine_specs = self.config.ard_system["modeling_options"]["windIO_plant"]["wind_farm"][
             "turbine"
         ]
         # windio rated power in W, convert to kW
         self.turbine_rating_kw = turbine_specs["performance"]["rated_power"] * 1e-3
-        self.plant_rating_kw = self.n_turbines * self.turbine_rating_kw
-        self.plant_capacity = self.plant_rating_kw * self.hours_per_year
+
+        # N_turbines is an input (not a fixed setup-time constant) so that
+        # rated_electricity_production/capacity_factor track the driven value in
+        # surrogate mode, rather than staying pinned to the config's initial N.
+        # In flowfarm/FLORIS mode this input is left unconnected -- N_turbines is
+        # fixed by the x/y layout there anyway -- so it just keeps the previous,
+        # config-derived constant behavior.
+        self.add_input("N_turbines", val=n_turbines_init)
 
         self.add_input(
             "ard_electricity_out",
@@ -141,11 +154,16 @@ class WindArdPerformanceCompatibilityComponent(PerformanceModelBaseClass):
         scale = 1.0 / self.fraction_of_year_simulated
         self.declare_partials("annual_electricity_produced", "ard_electricity_out",
                               val=np.full((pl, n), scale))
-        self.declare_partials("capacity_factor", "ard_electricity_out",
-                              val=np.full((pl, n), scale / self.plant_capacity))
+        self.declare_partials("capacity_factor", "ard_electricity_out")
+        self.declare_partials("capacity_factor", "N_turbines")
+        self.declare_partials("rated_electricity_production", "N_turbines",
+                              val=self.turbine_rating_kw)
 
     def compute(self, inputs, outputs):
         ard_electricity_series = inputs["ard_electricity_out"]
+        n_turbines = inputs["N_turbines"].item()
+        plant_rating_kw = n_turbines * self.turbine_rating_kw
+        plant_capacity = plant_rating_kw * self.hours_per_year
 
         # ard has no concept of time and will simulate for all
         # wind conditions provided, including duplicates. Here we
@@ -157,8 +175,25 @@ class WindArdPerformanceCompatibilityComponent(PerformanceModelBaseClass):
         outputs["electricity_out"] = ard_electricity_series
         outputs["total_electricity_produced"] = ard_electricity_series.sum()
         outputs["annual_electricity_produced"] = aep
-        outputs["rated_electricity_production"] = self.plant_rating_kw
-        outputs["capacity_factor"] = aep / self.plant_capacity
+        outputs["rated_electricity_production"] = plant_rating_kw
+        outputs["capacity_factor"] = aep / plant_capacity
+
+    def compute_partials(self, inputs, partials):
+        n = self.n_timesteps
+        pl = self.plant_life
+        ard_electricity_series = inputs["ard_electricity_out"]
+        n_turbines = inputs["N_turbines"].item()
+        plant_rating_kw = n_turbines * self.turbine_rating_kw
+        plant_capacity = plant_rating_kw * self.hours_per_year
+        aep = ard_electricity_series.sum() / self.fraction_of_year_simulated
+        scale = 1.0 / self.fraction_of_year_simulated
+
+        partials["capacity_factor", "ard_electricity_out"] = np.full((pl, n), scale / plant_capacity)
+        # d(capacity_factor)/d(N_turbines) = -aep / (N^2 * turbine_rating_kw * hours_per_year)
+        #                                   = -capacity_factor / N_turbines
+        partials["capacity_factor", "N_turbines"] = np.full(
+            (pl, 1), -(aep / plant_capacity) / n_turbines
+        )
 
 
 class WindArdCostCompatibilityComponent(CostModelBaseClass):
@@ -200,6 +235,32 @@ class WindArdCostCompatibilityComponent(CostModelBaseClass):
             "total_length_cables"
         ]
         outputs["OpEx"] = inputs["ard_OpEx"]
+
+
+class CachedArdSubmodelComp(om.SubmodelComp):
+    """SubmodelComp wrapping the Ard/FLOWFarm sub-problem, with input-hash caching.
+
+    Once turbine layout (x/y positions, substation positions) is held fixed -- e.g.
+    during the sizing/control co-optimization phase, where layout is no longer a
+    design variable -- repeated compute() calls receive identical inputs and would
+    otherwise re-solve the FLOWFarm wake model for no reason (each solve costs several
+    seconds). Skip the inner problem's run_model()/run_driver() when the inputs are
+    unchanged from the last call and reuse the cached outputs instead.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cache_key = None
+        self._cache_outputs = None
+
+    def compute(self, inputs, outputs):
+        key = inputs.asarray().tobytes()
+        if key == self._cache_key and self._cache_outputs is not None:
+            self._outputs.set_val(self._cache_outputs)
+            return
+        super().compute(inputs, outputs)
+        self._cache_key = key
+        self._cache_outputs = self._outputs.asarray().copy()
 
 
 class ArdWindPlantModel(om.Group):
@@ -247,12 +308,98 @@ class ArdWindPlantModel(om.Group):
         ard_input_dict = self.config.ard_system
         ard_data_path = self.config.ard_data_path
 
-        # Debug: check what N_turbines is in ard_input_dict
-        n_turbines = ard_input_dict.get("modeling_options", {}).get("layout", {}).get("N_turbines")
-        x_turbines = ard_input_dict.get("modeling_options", {}).get("layout", {}).get("x_turbines", [])
-        y_turbines = ard_input_dict.get("modeling_options", {}).get("layout", {}).get("y_turbines", [])
-        print(f"[ArdWindPlantModel.setup] N_turbines={n_turbines}, x_turbines count={len(x_turbines)}, y_turbines count={len(y_turbines)}", flush=True)
+        modeling_options = ard_input_dict.get("modeling_options", {})
+        use_surrogate = "surrogate" in modeling_options
 
+        n_timesteps = self.options["plant_config"]["plant"]["simulation"]["n_timesteps"]
+
+        if use_surrogate:
+            # N_turbines-only surrogate mode (build_surrogate.py, hybridfarm repo
+            # root): skips FLOWFarm/optiwindnet/LandBOSSE entirely -- no x/y layout,
+            # no Julia sub-problem -- in favor of the (ws, wd, N_turbines) -> power
+            # and N_turbines -> CapEx/OpEx fits. N_turbines becomes a continuous,
+            # driveable design variable rather than a fixed layout-derived count.
+            if SurrogateFarmPower is None or SurrogateWindCost is None:
+                raise ModuleNotFoundError(
+                    "modeling_options.surrogate was set but ard.farm_aero.surrogate/"
+                    "ard.cost.surrogate_cost could not be imported."
+                )
+            surrogate_opts = modeling_options["surrogate"]
+            n_turbines_init = float(
+                modeling_options.get("layout", {}).get("N_turbines", 25)
+            )
+
+            self.add_subsystem(
+                "n_turbines_ivc",
+                om.IndepVarComp("N_turbines", n_turbines_init),
+                promotes=["*"],
+            )
+            self.add_subsystem(
+                "surrogate_power",
+                SurrogateFarmPower(
+                    surrogate_pkl_path=surrogate_opts["f_power_pkl"],
+                    wind_resource_npz_path=surrogate_opts["wind_resource_npz"],
+                    n_timesteps=n_timesteps,
+                ),
+                promotes_inputs=["N_turbines"],
+                promotes_outputs=[("electricity_out", "ard_electricity_out")],
+            )
+            self.add_subsystem(
+                "surrogate_cost",
+                SurrogateWindCost(surrogate_pkl_path=surrogate_opts["g_cost_pkl"]),
+                promotes_inputs=["N_turbines"],
+                promotes_outputs=[("CapEx", "ard_CapEx"), ("OpEx", "ard_OpEx")],
+            )
+            # surrogate CapEx already includes cabling cost (direct + LandBOSSE BOS
+            # effect, see SurrogateWindCost) -- zero this out so
+            # WindArdCostCompatibilityComponent's cable_cost_per_meter add-on below
+            # doesn't double-count it.
+            self.add_subsystem(
+                "cable_length_zero_ivc",
+                om.IndepVarComp("total_length_cables", 0.0, units="m"),
+                promotes=["*"],
+            )
+        else:
+            self._setup_flowfarm_subprob(ard_input_dict, ard_data_path, modeling_options, n_timesteps)
+
+        # add performance model to include inputs and
+        # outputs as expected by H2Integrate
+        self.add_subsystem(
+            "wind_ard_performance_compatibility",
+            WindArdPerformanceCompatibilityComponent(
+                driver_config=self.options["driver_config"],
+                plant_config=self.options["plant_config"],
+                tech_config=self.options["tech_config"],
+            ),
+            promotes=["*"],
+        )
+
+        # add pass-through cost model to include cost_year as expected by H2Integrate.
+        # Promote everything EXCEPT cost_year — cost_year is a discrete constant that
+        # must not appear in the derivative chain from x_turbines (which flows through
+        # ard_CapEx into this component). A separate IndepVarComp owns cost_year instead.
+        self.add_subsystem(
+            "wind_ard_cost_compatibility",
+            WindArdCostCompatibilityComponent(
+                driver_config=self.options["driver_config"],
+                plant_config=self.options["plant_config"],
+                tech_config=self.options["tech_config"],
+            ),
+            promotes_inputs=["*"],
+            promotes_outputs=["CapEx", "OpEx", "VarOpEx"],
+        )
+
+        # Provide cost_year independently so it has no dependency on continuous DVs.
+        cost_params = self.options["tech_config"]["model_inputs"].get("cost_parameters", {})
+        cost_year = int(cost_params.get("cost_year", 2024))
+        cost_year_ivc = om.IndepVarComp()
+        cost_year_ivc.add_discrete_output("cost_year", val=cost_year)
+        self.add_subsystem("cost_year_src", cost_year_ivc, promotes_outputs=["cost_year"])
+
+    def _setup_flowfarm_subprob(self, ard_input_dict, ard_data_path, modeling_options, n_timesteps):
+        """Full FLOWFarm/FLORIS + optiwindnet collection + LandBOSSE sub-problem,
+        driven by an explicit x/y turbine layout (as opposed to the N_turbines-only
+        `use_surrogate` path in setup())."""
         ard_prob = set_up_ard_model(input_dict=ard_input_dict, root_data_path=ard_data_path)
 
         # x_turbines_in/y_turbines_in are unconnected inputs in the inner problem;
@@ -260,7 +407,6 @@ class ArdWindPlantModel(om.Group):
         # _auto_ivc-tagged outputs as driveable inputs to the outer problem.
 
         # detect FLOWFarm vs FLORIS and wind resource mode
-        modeling_options = ard_input_dict.get("modeling_options", {})
         use_flowfarm = "flowfarm" in modeling_options
         wind_resource = (
             modeling_options
@@ -305,7 +451,7 @@ class ArdWindPlantModel(om.Group):
         # add ard to the h2i model as a sub-problem
         # SubmodelComp alias ("inner_name", "outer_promoted_name") maps the outer IVC's
         # x_turbines/y_turbines to the inner x_turbines_in/y_turbines_in.
-        subprob_ard = om.SubmodelComp(
+        subprob_ard = CachedArdSubmodelComp(
             problem=ard_prob,
             inputs=[
                 ("x_turbines_in", "x_turbines"),
@@ -323,7 +469,6 @@ class ArdWindPlantModel(om.Group):
             promotes=["*"],
         )
 
-        n_timesteps = self.options["plant_config"]["plant"]["simulation"]["n_timesteps"]
         if use_batch_power:
             # FLOWFarmBatchPower: per-state power (W, length n_timesteps) → kW time-series
             self.add_subsystem(
@@ -338,38 +483,4 @@ class ArdWindPlantModel(om.Group):
                 AEPBroadcastComponent(n_timesteps=n_timesteps),
                 promotes=["*"],
             )
-
-        # add performance model to include inputs and
-        # outputs as expected by H2Integrate
-        self.add_subsystem(
-            "wind_ard_performance_compatibility",
-            WindArdPerformanceCompatibilityComponent(
-                driver_config=self.options["driver_config"],
-                plant_config=self.options["plant_config"],
-                tech_config=self.options["tech_config"],
-            ),
-            promotes=["*"],
-        )
-
-        # add pass-through cost model to include cost_year as expected by H2Integrate.
-        # Promote everything EXCEPT cost_year — cost_year is a discrete constant that
-        # must not appear in the derivative chain from x_turbines (which flows through
-        # ard_CapEx into this component). A separate IndepVarComp owns cost_year instead.
-        self.add_subsystem(
-            "wind_ard_cost_compatibility",
-            WindArdCostCompatibilityComponent(
-                driver_config=self.options["driver_config"],
-                plant_config=self.options["plant_config"],
-                tech_config=self.options["tech_config"],
-            ),
-            promotes_inputs=["*"],
-            promotes_outputs=["CapEx", "OpEx", "VarOpEx"],
-        )
-
-        # Provide cost_year independently so it has no dependency on continuous DVs.
-        cost_params = self.options["tech_config"]["model_inputs"].get("cost_parameters", {})
-        cost_year = int(cost_params.get("cost_year", 2024))
-        cost_year_ivc = om.IndepVarComp()
-        cost_year_ivc.add_discrete_output("cost_year", val=cost_year)
-        self.add_subsystem("cost_year_src", cost_year_ivc, promotes_outputs=["cost_year"])
 
