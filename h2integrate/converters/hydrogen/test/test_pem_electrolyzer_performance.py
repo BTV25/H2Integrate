@@ -129,3 +129,42 @@ def test_electrolyzer_outputs(tech_config, plant_config, subtests):
         assert prob.get_val("comp.operational_life", units="yr") == plant_life
     with subtests.test("replacement_schedule value"):
         assert np.any(prob.get_val("comp.replacement_schedule", units="unitless") == 0)
+
+
+@pytest.mark.unit
+def test_n_clusters_sizing_gradient_across_bin_boundary(tech_config, plant_config, subtests):
+    """d(total_hydrogen_produced)/d(n_clusters) must match FD on both sides of, and exactly
+    at, a cluster-count bin boundary -- regression test for the PCHIP sizing smoothing
+    (previously this partial was only correct within one round()-based bin)."""
+    n_timesteps = int(plant_config["plant"]["simulation"]["n_timesteps"])
+    power_profile = np.ones(n_timesteps) * 32.0
+    step = 1e-4
+
+    def total_h2_and_size(n_clusters_val):
+        prob = om.Problem()
+        comp = ECOElectrolyzerPerformanceModel(
+            plant_config=plant_config, tech_config=tech_config, driver_config={}
+        )
+        prob.model.add_subsystem("comp", comp, promotes=["*"])
+        prob.setup()
+        prob.set_val("comp.electricity_in", power_profile, units="MW")
+        prob.set_val("comp.n_clusters", n_clusters_val)
+        prob.run_model()
+        return (
+            float(prob.get_val("comp.total_hydrogen_produced")[0]),
+            float(prob.get_val("comp.electrolyzer_size_mw")[0]),
+            comp,
+        )
+
+    for n_clusters_val in [2.1, 2.5, 2.9]:
+        with subtests.test(f"n_clusters={n_clusters_val}"):
+            h2_0, size_0, comp = total_h2_and_size(n_clusters_val)
+            h2_1, size_1, _ = total_h2_and_size(n_clusters_val + step)
+
+            fd_h2 = (h2_1 - h2_0) / step
+            fd_size = (size_1 - size_0) / step
+            analytic_h2 = float(comp._pchip_total_deriv(comp._n_continuous))
+            analytic_size = float(comp.config.cluster_rating_MW)
+
+            assert np.isclose(fd_h2, analytic_h2, rtol=1e-2)
+            assert np.isclose(fd_size, analytic_size, rtol=1e-6)
