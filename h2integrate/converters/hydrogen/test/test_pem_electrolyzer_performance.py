@@ -32,6 +32,7 @@ def tech_config():
                 "uptime_hours_until_eol": 8000,
                 "include_degradation_penalty": True,
                 "turndown_ratio": 0.1,
+                "activation_frac": 0.1,
                 "electrolyzer_capex": 10.0,
             }
         }

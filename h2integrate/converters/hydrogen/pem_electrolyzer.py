@@ -53,6 +53,41 @@ def _make_jax_h2_per_stack_fn(curve_coeff):
     return h2_per_stack_fn
 
 
+def _make_jax_dispatch_h2_fn(h2_per_stack_fn, n_stacks_per_cluster, cluster_rating_kw, turndown_ratio):
+    """Smooth (continuous-relaxation) surrogate for even_split_power_with_activation()'s
+    multi-cluster dispatch, used only for the electricity_in / activation_frac Jacobian --
+    the forward hydrogen_out value always comes from the real discrete dispatch (see
+    compute()). Cluster 1 ramps on from 0 to 1 as power reaches the turndown floor, holds at
+    1 until power reaches the activation threshold, then the number of active clusters ramps
+    continuously up to num_clusters while held at that per-cluster power. Matches the real
+    discrete dispatch exactly at every breakpoint (verified against
+    outputs/2026-08-19_dispatch_activation_frac_candidate.png), smooth in between.
+
+    Returns fn(power_kw, activation_frac, num_clusters) -> total_h2_kg_hr. power_kw and
+    activation_frac are traced by JAX; num_clusters is a plain python int (not differentiated).
+    """
+    p_min = turndown_ratio * cluster_rating_kw
+
+    def h2_per_cluster_kg_hr(power_per_cluster_kw):
+        return n_stacks_per_cluster * h2_per_stack_fn(power_per_cluster_kw / n_stacks_per_cluster)
+
+    def fn(power_kw, activation_frac, num_clusters):
+        p_act = activation_frac * cluster_rating_kw
+        n_ramp_on = power_kw / p_min
+        n_saturating = jnp.clip(power_kw / p_act, 1.0, float(num_clusters))
+        n_on = jnp.where(
+            power_kw <= p_min, n_ramp_on, jnp.where(power_kw <= p_act, 1.0, n_saturating)
+        )
+        power_per_cluster = jnp.where(
+            power_kw <= p_min,
+            p_min,
+            jnp.where(power_kw <= p_act, power_kw, power_kw / n_saturating),
+        )
+        return n_on * h2_per_cluster_kg_hr(power_per_cluster)
+
+    return fn
+
+
 @define(kw_only=True)
 class ECOElectrolyzerPerformanceModelConfig(ResizeablePerformanceModelBaseConfig):
     """
@@ -79,6 +114,11 @@ class ECOElectrolyzerPerformanceModelConfig(ResizeablePerformanceModelBaseConfig
         include_degradation_penalty (bool): Flag to include degradation of the electrolyzer due to
             operational hours, ramping, and on/off power cycles.
         turndown_ratio (float): The ratio at which the electrolyzer will shut down.
+        activation_frac (float): Fraction of cluster_rating_MW that already-active clusters
+            must reach (per active cluster) before the next cluster is activated. Must be
+            >= turndown_ratio. Kept separate from turndown_ratio: that ratio governs the
+            hardware minimum operating point of a single cluster, while this governs the
+            economic dispatch decision of when to bring another cluster online.
         electrolyzer_capex (int): $/kW overnight installed capital costs for a 1 MW system in
             2022 USD/kW (DOE hydrogen program record 24005 Clean Hydrogen Production Cost Scenarios
             with PEM Electrolyzer Technology 05/20/24) #TODO: convert to refs
@@ -92,7 +132,16 @@ class ECOElectrolyzerPerformanceModelConfig(ResizeablePerformanceModelBaseConfig
     uptime_hours_until_eol: int = field(validator=gt_zero)
     include_degradation_penalty: bool = field()
     turndown_ratio: float = field(validator=gt_zero)
+    activation_frac: float = field(validator=gt_zero)
     electrolyzer_capex: int = field()
+    # If True, hydrogen_out/total/annual/capacity_factor come from the smooth dispatch
+    # surrogate (see _dispatch_h2_at_n_pem) instead of the real discrete, degradation-aware
+    # simulation -- so the forward pass exactly matches the model used for its own
+    # electricity_in/activation_frac gradient. Only enable this for gradient-based
+    # sizing/dispatch optimization; leave False (default) for analysis runs and for anything
+    # (e.g. WOMBAT O&M studies) that needs degradation-aware hydrogen output. Validate a
+    # final optimized design point separately against the real simulation.
+    smooth_dispatch_forward: bool = field(default=False)
 
 
 class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
@@ -107,6 +156,11 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
             strict=False,
             additional_cls_name=self.__class__.__name__,
         )
+        if self.config.activation_frac < self.config.turndown_ratio:
+            raise ValueError(
+                f"activation_frac ({self.config.activation_frac}) must be >= turndown_ratio "
+                f"({self.config.turndown_ratio})"
+            )
         super().setup()
         self.add_output(
             "efficiency",
@@ -124,6 +178,15 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
             val=self.config.n_clusters,
             units="unitless",
             desc="number of electrolyzer clusters in the system",
+        )
+        self.add_input(
+            "activation_frac",
+            val=self.config.activation_frac,
+            units="unitless",
+            desc=(
+                "fraction of cluster_rating_MW that already-active clusters must reach "
+                "before the next cluster is activated"
+            ),
         )
 
         self.add_output(
@@ -154,8 +217,17 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
             turndown_ratio=self.config.turndown_ratio,
         )
         self._jax_h2_fn = _make_jax_h2_per_stack_fn(_pem_tmp.curve_coeff)
+        self._n_stacks_per_cluster = int(round(self.config.cluster_rating_MW))
+        self._jax_dispatch_fn = _make_jax_dispatch_h2_fn(
+            self._jax_h2_fn,
+            n_stacks_per_cluster=self._n_stacks_per_cluster,
+            cluster_rating_kw=self.config.cluster_rating_MW * 1e3,
+            turndown_ratio=self.config.turndown_ratio,
+        )
+        self._h2_per_stack_rated = float(self._jax_h2_fn(self._STACK_RATING_KW))
         self._n_total_stacks = 1
         self._scale = 1.0
+        self._activation_frac_val = self.config.activation_frac
 
     def setup_partials(self):
         n_ts = self.options["plant_config"]["plant"]["simulation"]["n_timesteps"]
@@ -189,6 +261,19 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
             rows=np.arange(plant_life), cols=np.zeros(plant_life, int),
         )
 
+        # Dispatch derivative (activation_frac is the scalar multi-cluster activation
+        # threshold -- see compute_partials for the smooth-surrogate derivation).
+        self.declare_partials("hydrogen_out", "activation_frac", rows=arange, cols=zeros)
+        self.declare_partials("total_hydrogen_produced", "activation_frac")
+        self.declare_partials(
+            "annual_hydrogen_produced", "activation_frac",
+            rows=np.arange(plant_life), cols=np.zeros(plant_life, int),
+        )
+        self.declare_partials(
+            "capacity_factor", "activation_frac",
+            rows=np.arange(plant_life), cols=np.zeros(plant_life, int),
+        )
+
         self._n_ts = n_ts
         self._plant_life = plant_life
 
@@ -199,36 +284,43 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
     _STACK_RATING_KW = 1000.0
 
     def compute_partials(self, inputs, partials, discrete_inputs=None):
-        # --- electricity_in: JAX diagonal Jacobian ---
-        # d(hydrogen_out[t])/d(electricity_in[t]) = scale * grad(h2_per_stack)(P/n_total_stacks)
-        # n_total_stacks cancels in the chain rule (see derivation in NOTES.md).
+        # --- electricity_in & activation_frac: JAX dispatch-aware Jacobian ---
+        # d(hydrogen_out[t])/d(electricity_in[t]) and d(hydrogen_out[t])/d(activation_frac)
+        # both come from _jax_dispatch_fn, the smooth continuous-relaxation surrogate of
+        # even_split_power_with_activation() (see _make_jax_dispatch_h2_fn). It matches the
+        # real discrete dispatch exactly at every breakpoint; kinked (not differentiable)
+        # only at the turndown/activation thresholds themselves, a measure-zero set.
         # Zero out off-timesteps: when electricity_in[t] < cluster min power, the
         # electrolyzer is off and d(hydrogen_out)/d(electricity_in) = 0.  FD gives 0
         # at those timesteps (relative step × 0 = 0), so analytic must match.
-        # NOTE: this Jacobian uses the *nearest* integer cluster count's stack count as a
-        # representative dispatch configuration (self._n_total_stacks, set in compute()) and
-        # does not propagate through the n_clusters PCHIP blend across neighboring cluster
-        # counts, nor through the per-timestep multi-cluster dispatch split -- both are Phase 2
-        # scope (dispatch-side floor/staircase), not this phase (sizing bin-crossing).
+        # NOTE: this Jacobian uses the *nearest* integer cluster count (self._n_pem_clusters)
+        # as a representative dispatch configuration and does not propagate through the
+        # n_clusters PCHIP blend across neighboring cluster counts -- that remains Phase 1
+        # scope (sizing bin-crossing), not this (dispatch-side) derivative.
         elec = inputs["electricity_in"]
-        if self._n_total_stacks <= 0:
+        act_frac = self._activation_frac_val
+        n_pem = self._n_pem_clusters
+        if self._n_total_stacks <= 0 or n_pem <= 0:
             # No electrolyzer at this size: hydrogen_out is identically zero regardless of
-            # electricity_in, so the Jacobian is zero.
+            # electricity_in or activation_frac, so both Jacobians are zero.
             jac_diag = np.zeros(len(elec))
+            jac_act = np.zeros(len(elec))
         else:
-            n = float(self._n_total_stacks)
-            power_per_stack = jnp.array(elec / n, dtype=jnp.float64)
+            elec_j = jnp.array(elec, dtype=jnp.float64)
+            grad_fn = jax.vmap(
+                jax.grad(self._jax_dispatch_fn, argnums=(0, 1)), in_axes=(0, None, None)
+            )
+            d_p, d_act = grad_fn(elec_j, act_frac, n_pem)
             # Use forward-pass output to mask off-timesteps: if run_h2_PEM produced no
             # hydrogen at timestep t, FD also gives 0, so analytic must match.
             on_mask = (self._h2_out_scaled > 0).astype(float) if len(self._h2_out_scaled) == len(elec) else np.ones(len(elec))
-            # Zero out saturated timesteps: external_power_supply() clips power_per_stack at
-            # _STACK_RATING_KW, so beyond that point hydrogen_out no longer responds to
-            # electricity_in and FD correctly gives 0 there too.
-            sat_mask = (np.asarray(power_per_stack) < self._STACK_RATING_KW).astype(float)
-            jac_diag = (
-                np.array(jax.vmap(jax.grad(self._jax_h2_fn))(power_per_stack))
-                * self._scale * on_mask * sat_mask
-            )
+            # Zero out saturated timesteps: external_power_supply() clips per-stack power at
+            # _STACK_RATING_KW once every cluster is on, so beyond that point hydrogen_out no
+            # longer responds and FD correctly gives 0 there too.
+            power_per_stack_full = np.asarray(elec) / float(self._n_total_stacks)
+            sat_mask = (power_per_stack_full < self._STACK_RATING_KW).astype(float)
+            jac_diag = np.array(d_p) * on_mask * sat_mask
+            jac_act = np.array(d_act) * on_mask * sat_mask
 
         partials["hydrogen_out", "electricity_in"] = jac_diag
         partials["total_hydrogen_produced", "electricity_in"] = jac_diag
@@ -237,6 +329,18 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
         cf_denom = rated_h2 * self._n_ts if rated_h2 > 0 else 1.0
         partials["annual_hydrogen_produced", "electricity_in"] = np.tile(jac_diag, self._plant_life)
         partials["capacity_factor", "electricity_in"] = np.tile(jac_diag / cf_denom, self._plant_life)
+
+        partials["hydrogen_out", "activation_frac"] = jac_act
+        partials["total_hydrogen_produced", "activation_frac"] = float(jac_act.sum())
+        # annual_hydrogen_produced/capacity_factor are scalar-per-year broadcasts (see
+        # compute()), same approximation as the electricity_in partials above: assume the
+        # simulated year's sensitivity is representative of every year.
+        partials["annual_hydrogen_produced", "activation_frac"] = np.full(
+            self._plant_life, float(jac_act.sum())
+        )
+        partials["capacity_factor", "activation_frac"] = np.full(
+            self._plant_life, float(jac_act.sum()) / cf_denom
+        )
 
         # --- n_clusters: sizing derivative ---
         # electrolyzer_size_mw = n_clusters * cluster_rating_MW is exact and continuous in
@@ -335,6 +439,33 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
             "n_total_stacks": n_pem * int(round(self.config.cluster_rating_MW)),
         }
 
+    def _dispatch_h2_at_n_pem(self, n_pem, power_kw, activation_frac, n_ts):
+        """Smooth-surrogate forward evaluation at an exact integer cluster count -- the same
+        _jax_dispatch_fn used for the electricity_in/activation_frac Jacobian, so the
+        optimization forward pass and its gradient come from one consistent model. No
+        degradation modeling (BOL curve only). Used for one node of the n_clusters PCHIP
+        blend in compute(); the true discrete, degradation-aware simulation
+        (_run_pem_at_n_pem / run_PEM_main.even_split_power_with_activation) stays available
+        separately to validate a final optimized design point against.
+        """
+        if n_pem <= 0:
+            hydrogen_out = np.zeros(n_ts)
+        else:
+            hydrogen_out = np.array(
+                self._jax_dispatch_fn(jnp.asarray(power_kw, dtype=jnp.float64), activation_frac, n_pem)
+            )
+        total_h2 = float(hydrogen_out.sum())
+        annual_h2 = total_h2 * (8760.0 / n_ts)
+        rated_h2_rate = n_pem * self._n_stacks_per_cluster * self._h2_per_stack_rated
+        rated_total = rated_h2_rate * n_ts
+        capacity_factor = total_h2 / rated_total if rated_total > 0 else 0.0
+        return {
+            "hydrogen_out": hydrogen_out,
+            "total_hydrogen_produced": total_h2,
+            "annual_hydrogen_produced": annual_h2,
+            "capacity_factor": np.full(self.plant_life, capacity_factor),
+        }
+
     def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
         plant_life = self.options["plant_config"]["plant"]["plant_life"]
         electrolyzer_size_mw = inputs["n_clusters"][0] * self.config.cluster_rating_MW
@@ -389,26 +520,45 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
         self._n_continuous = n_continuous
         self._n_pem_clusters = int(round(n_continuous))
 
+        activation_frac_val = float(inputs["activation_frac"][0])
         pem_param_dict = {
             "eol_eff_percent_loss": self.config.eol_eff_percent_loss,
             "uptime_hours_until_eol": self.config.uptime_hours_until_eol,
             "include_degradation_penalty": self.config.include_degradation_penalty,
             "turndown_ratio": self.config.turndown_ratio,
+            "activation_frac": activation_frac_val,
         }
+        self._activation_frac_val = activation_frac_val
         energy_to_electrolyzer_kw = inputs["electricity_in"]
+        n_ts = len(energy_to_electrolyzer_kw)
 
-        sims = {
-            n_pem: self._run_pem_at_n_pem(
-                n_pem,
-                energy_to_electrolyzer_kw,
-                plant_life,
-                electrolyzer_capex_kw,
-                pem_param_dict,
-                grid_connection_scenario,
-                hydrogen_production_capacity_required_kgphr,
-            )
-            for n_pem in neighbor_ns
-        }
+        if self.config.smooth_dispatch_forward:
+            # PCHIP nodes: the smooth dispatch surrogate at each exact integer cluster count
+            # -- the SAME function used for the electricity_in/activation_frac Jacobian below,
+            # so the optimization forward pass is exactly consistent with its own gradient (no
+            # degradation modeling during the search). See _dispatch_h2_at_n_pem.
+            sims = {
+                n_pem: self._dispatch_h2_at_n_pem(
+                    n_pem, energy_to_electrolyzer_kw, activation_frac_val, n_ts
+                )
+                for n_pem in neighbor_ns
+            }
+        else:
+            # PCHIP nodes: the true discrete, degradation-aware simulation (default) --
+            # electricity_in/activation_frac partials remain the smooth-surrogate
+            # approximation documented in compute_partials.
+            sims = {
+                n_pem: self._run_pem_at_n_pem(
+                    n_pem,
+                    energy_to_electrolyzer_kw,
+                    plant_life,
+                    electrolyzer_capex_kw,
+                    pem_param_dict,
+                    grid_connection_scenario,
+                    hydrogen_production_capacity_required_kgphr,
+                )
+                for n_pem in neighbor_ns
+            }
 
         nodes = np.array(neighbor_ns, dtype=float)
         hydrogen_stack = np.stack([sims[n]["hydrogen_out"] for n in neighbor_ns], axis=0)
@@ -438,9 +588,24 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
         self._pchip_cf_deriv = pchip_cf.derivative()
         self._h2_out_scaled = outputs["hydrogen_out"]
 
-        # Informational-only outputs (no declared n_clusters partials): report the nearest
-        # integer configuration's simulation rather than interpolating them.
-        nearest = sims[int(np.clip(round(n_continuous), neighbor_ns[0], neighbor_ns[-1]))]
+        # Informational-only outputs (no declared partials): report the nearest integer
+        # configuration's TRUE discrete, degradation-aware simulation rather than the smooth
+        # surrogate. In default mode `sims` already holds real simulations; in
+        # smooth_dispatch_forward mode this is the one real run_h2_PEM call per compute(),
+        # used only for these non-differentiated outputs.
+        nearest_n = int(np.clip(round(n_continuous), neighbor_ns[0], neighbor_ns[-1]))
+        if self.config.smooth_dispatch_forward:
+            nearest = self._run_pem_at_n_pem(
+                nearest_n,
+                energy_to_electrolyzer_kw,
+                plant_life,
+                electrolyzer_capex_kw,
+                pem_param_dict,
+                grid_connection_scenario,
+                hydrogen_production_capacity_required_kgphr,
+            )
+        else:
+            nearest = sims[nearest_n]
         outputs["efficiency"] = nearest["efficiency"]
         outputs["replacement_schedule"] = nearest["replacement_schedule"]
         outputs["time_until_replacement"] = nearest["time_until_replacement"]

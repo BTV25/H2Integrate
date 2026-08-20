@@ -45,6 +45,7 @@ technologies:
         uptime_hours_until_eol: 80000.  # number of 'on' hours until electrolyzer reaches eol
         include_degradation_penalty: true  # include degradation
         turndown_ratio: 0.1  # turndown_ratio = minimum_cluster_power/cluster_rating_MW
+        activation_frac: 0.1  # power fraction of cluster_rating_MW that active clusters must reach before the next cluster is activated
       financial_parameters:
         capital_items:
           depr_period: 7  # based on PEM Electrolysis H2A Production Case Study Documentation estimate of 7 years. also see https://www.irs.gov/publications/p946#en_US_2020_publink1000107507

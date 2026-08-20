@@ -42,6 +42,7 @@ technologies:
         uptime_hours_until_eol: 80000.  # number of 'on' hours until electrolyzer reaches eol
         include_degradation_penalty: true  # include degradation
         turndown_ratio: 0.1  # turndown_ratio = minimum_cluster_power/cluster_rating_MW
+        activation_frac: 0.1  # power fraction of cluster_rating_MW that active clusters must reach before the next cluster is activated
         location: onshore
         electrolyzer_capex: 1295  # unused in the performance model if pem_control_type is 'basic' but required as an input
       cost_parameters:
