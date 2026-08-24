@@ -65,16 +65,58 @@ def _make_jax_dispatch_h2_fn(h2_per_stack_fn, n_stacks_per_cluster, cluster_rati
 
     Returns fn(power_kw, activation_frac, num_clusters) -> total_h2_kg_hr. power_kw and
     activation_frac are traced by JAX; num_clusters is a plain python int (not differentiated).
+
+    Below p_min the real discrete dispatch is exactly off (hydrogen_out == 0), while the
+    linear n_ramp_on term above only approaches that at power_kw == 0 -- a mismatch of up
+    to ~40 kg/hr near p_min (see outputs/figures/electrolyzer_actual_vs_surrogate_rampon.png).
+    Two corrections, both derived/tuned 2026-08-24 (see outputs/figures/electrolyzer_leak_candidate*.png
+    and electrolyzer_upper_clip_fix_candidates.png):
+
+    1. A steep logistic gate centered at p_min multiplies the raw dispatch output to
+       suppress it toward 0 below p_min while saturating to 1 quickly above it (GATE_K
+       chosen tight enough that it no longer visibly distorts H2 output past ~1.5x p_min,
+       unlike an earlier looser-gate attempt which sagged the whole 2-5 MW region).
+    2. A small linear "leak" term (EPS * power_kw) is blended in via (1 - gate), active only
+       below p_min, purely to keep d(H2)/d(power) meaningfully positive there (EPS =
+       0.0015 kg/hr/kW, chosen as the loosest floor that still keeps H2 output close to
+       actual) -- gradient-based optimization needs a nonzero slope to find its way toward
+       turning the electrolyzer on at all.
+
+    gate*raw + (1-gate)*leak is smooth (both terms + gate are C^inf) and non-decreasing:
+    raw, leak, and gate are all non-negative and non-decreasing in power_kw, so
+    d/dp[gate*raw + (1-gate)*leak] = gate'*(raw-leak) + gate*raw' + (1-gate)*leak' is a sum
+    of terms that stay >= 0 in the regime that matters (gate' > 0 only near p_min, where
+    raw >= leak by construction of the fit) -- verified numerically (min derivative across
+    the full domain == EPS, i.e. exactly the leak floor, with no negative dip; see
+    scan_electrolyzer_kinks.py in the hybridfarm repo).
+
+    The upper end of n_saturating = clip(power_kw/p_act, 1, num_clusters) has its own
+    smaller kink where the clip hits num_clusters (all clusters fully loaded, ~0.0008
+    kg/hr/kW jump at power_kw = num_clusters*p_act) -- replaced with a smooth-min
+    relaxation (smin, via softplus) that approaches the same asymptotes but stays C^inf
+    and non-decreasing throughout (steepness UPPER_CLIP_S=8, chosen as a middle ground:
+    smooth without noticeably widening the saturation transition).
     """
     p_min = turndown_ratio * cluster_rating_kw
+    GATE_K = 0.01  # 1/kW
+    EPS = 0.0015  # kg/hr per kW, minimum d(H2)/d(power) floor below p_min
+    UPPER_CLIP_S = 8.0  # smooth-min steepness for the num_clusters saturation bound
 
     def h2_per_cluster_kg_hr(power_per_cluster_kw):
         return n_stacks_per_cluster * h2_per_stack_fn(power_per_cluster_kw / n_stacks_per_cluster)
 
+    def _smin(u, m, s):
+        # smooth min(u, m): -> u for u << m, -> m for u >> m; smooth & non-decreasing in u
+        return m - jax.nn.softplus(s * (m - u)) / s
+
     def fn(power_kw, activation_frac, num_clusters):
         p_act = activation_frac * cluster_rating_kw
         n_ramp_on = power_kw / p_min
-        n_saturating = jnp.clip(power_kw / p_act, 1.0, float(num_clusters))
+        # smooth relaxation of clip(power_kw/p_act, 1, num_clusters)'s upper bound only --
+        # the lower bound (1) is handled by the explicit "hold at 1" branch below, exactly
+        # as before, since x = power_kw/p_act >= 1 whenever this branch is evaluated.
+        x = power_kw / p_act
+        n_saturating = _smin(x, float(num_clusters), UPPER_CLIP_S)
         n_on = jnp.where(
             power_kw <= p_min, n_ramp_on, jnp.where(power_kw <= p_act, 1.0, n_saturating)
         )
@@ -83,7 +125,10 @@ def _make_jax_dispatch_h2_fn(h2_per_stack_fn, n_stacks_per_cluster, cluster_rati
             p_min,
             jnp.where(power_kw <= p_act, power_kw, power_kw / n_saturating),
         )
-        return n_on * h2_per_cluster_kg_hr(power_per_cluster)
+        raw = n_on * h2_per_cluster_kg_hr(power_per_cluster)
+        gate = jax.nn.sigmoid(GATE_K * (power_kw - p_min))
+        leak = EPS * power_kw
+        return gate * raw + (1.0 - gate) * leak
 
     return fn
 
