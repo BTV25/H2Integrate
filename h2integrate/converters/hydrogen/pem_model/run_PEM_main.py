@@ -54,10 +54,7 @@ class run_PEM_clusters:
         # capacity of each cluster, must be a multiple of 1 MW
 
         self.num_clusters = num_clusters
-        # Copy + pop activation_frac so it never reaches PEM_H2_Clusters(**self.user_params)
-        # in create_clusters() below, which has no such keyword.
-        self.user_params = dict(user_defined_electrolyzer_params)
-        activation_frac = self.user_params.pop("activation_frac", None)
+        self.user_params = user_defined_electrolyzer_params
         self.plant_life_yrs = useful_life
         # Do not modify stack_rating_kw or stack_min_power_kw
         # these represent the hard-coded and unmodifiable
@@ -69,12 +66,6 @@ class run_PEM_clusters:
         self.input_power_kw = electrical_power_signal
         self.cluster_min_power = self.stack_min_power_kw * self.cluster_cap_mw
         self.cluster_max_power = self.stack_rating_kw * self.cluster_cap_mw
-        # activation_frac is None unless explicitly provided -- run() then keeps using the
-        # original single-threshold even_split_power() untouched (see docstring there for why
-        # a naive reduction of the two-threshold dispatch to that formula isn't physical).
-        self.cluster_activation_power = (
-            None if activation_frac is None else activation_frac * self.cluster_max_power
-        )
 
         # For the optimization problem:
         self.T = len(self.input_power_kw)
@@ -107,10 +98,7 @@ class run_PEM_clusters:
     def run(self):
         # TODO: add control type as input!
         clusters = self.create_clusters()  # initialize clusters
-        if self.cluster_activation_power is None:
-            power_to_clusters = self.even_split_power()
-        else:
-            power_to_clusters = self.even_split_power_with_activation()
+        power_to_clusters = self.even_split_power()
         h2_df_ts = pd.DataFrame()
         h2_df_tot = pd.DataFrame()
 
@@ -176,45 +164,6 @@ class run_PEM_clusters:
             print(f"Took {round(end - start, 3)} sec to run even_split_power function")
         # rows are power, columns are stacks [300 x n_stacks]
 
-        return np.transpose(power_to_clusters)
-
-    def even_split_power_with_activation(self):
-        """Like even_split_power(), but cluster 2+ only turns on once the already-active
-        clusters' shared power would exceed cluster_activation_power -- a separate, usually
-        higher, threshold than cluster_min_power (don't add a cluster just because the
-        turndown floor allows it; wait until existing clusters are well utilized). Cluster 1
-        still turns on/off at cluster_min_power exactly as in even_split_power().
-
-        Does NOT reduce to even_split_power()'s floor() when cluster_activation_power equals
-        cluster_min_power -- a formula that forces that exact reduction would require a
-        single cluster to run above its own max rated power before a second one turns on
-        whenever cluster_activation_power > 0.5 * cluster_max_power, which isn't physical.
-        Kept as a separate method (not a generalization of even_split_power()) so the
-        original stays available, unmodified, for validating/evaluating against this policy.
-        """
-        start = time.perf_counter()
-        num_clusters_on = np.ceil(self.input_power_kw / self.cluster_activation_power)
-        num_clusters_on = np.clip(num_clusters_on, 1, self.num_clusters)
-        num_clusters_on = np.where(self.input_power_kw < self.cluster_min_power, 0, num_clusters_on)
-
-        power_per_cluster = [
-            self.input_power_kw[ti] / num_clusters_on[ti] if num_clusters_on[ti] > 0 else 0
-            for ti, pwr in enumerate(self.input_power_kw)
-        ]
-        power_per_to_active_clusters = np.array(power_per_cluster)
-        power_to_clusters = np.zeros((len(self.input_power_kw), self.num_clusters))
-        for i, cluster_power in enumerate(power_per_to_active_clusters):
-            clusters_off = self.num_clusters - int(num_clusters_on[i])
-            no_power = np.zeros(clusters_off)
-            with_power = cluster_power * np.ones(int(num_clusters_on[i]))
-            power_to_clusters[i] = np.concatenate((with_power, no_power))
-
-        end = time.perf_counter()
-        if self.verbose:
-            print(
-                f"Took {round(end - start, 3)} sec to run "
-                "even_split_power_with_activation function"
-            )
         return np.transpose(power_to_clusters)
 
     def max_h2_cntrl(self):
