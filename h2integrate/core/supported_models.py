@@ -79,6 +79,10 @@ from h2integrate.converters.water.desal.desalination import (
 from h2integrate.resource.wind.nlr_developer_wtk_api import WTKNLRDeveloperAPIWindResource
 from h2integrate.converters.hydrogen.basic_cost_model import BasicElectrolyzerCostModel
 from h2integrate.converters.hydrogen.pem_electrolyzer import ECOElectrolyzerPerformanceModel
+from h2integrate.converters.hydrogen.pem_electrolyzer_smooth import (
+    SmoothElectrolyzerPerformanceModel,
+)
+from h2integrate.converters.hydrogen.singlitico_cost_model_smooth import SmoothSingliticoCostModel
 from h2integrate.converters.solar.atb_res_com_pv_cost import ATBResComPVCostModel
 from h2integrate.converters.solar.atb_utility_pv_cost import ATBUtilityPVCostModel
 from h2integrate.converters.iron.martin_mine_cost_model import MartinIronMineCostComponent
@@ -204,6 +208,8 @@ supported_models = {
     "RunOfRiverHydroPerformanceModel": RunOfRiverHydroPerformanceModel,
     "RunOfRiverHydroCostModel": RunOfRiverHydroCostModel,
     "ECOElectrolyzerPerformanceModel": ECOElectrolyzerPerformanceModel,
+    "SmoothElectrolyzerPerformanceModel": SmoothElectrolyzerPerformanceModel,
+    "SmoothSingliticoCostModel": SmoothSingliticoCostModel,
     "SingliticoCostModel": SingliticoCostModel,
     "BasicElectrolyzerCostModel": BasicElectrolyzerCostModel,
     "CustomElectrolyzerCostModel": CustomElectrolyzerCostModel,
