@@ -46,8 +46,26 @@ accepted 2026-08-25 as good enough (median rel. error 24%, worst case 158% at a 
 `_FATIGUE_K_FIT` is a single constant fit by least squares in the exploration script, not
 re-fit per turndown_ratio.
 
-NOT yet wired into any cost/LCOH output -- these are raw degradation quantities (Volts) only;
-how they should feed into replacement cost / efficiency loss is still open.
+Wired into `replacement_schedule` (2026-08-25 session 10): frac_of_life_used = total_degradation_v
+/ d_eol (d_eol = `_PEMClusters.d_eol_curve[-1]`, the same threshold `calc_stack_replacement_info`
+uses for the real model's replacement schedule), annualized
+via the existing repeated-year assumption (`fraction_of_year_simulated`) and spread uniformly
+across every plant-life year, rather than the real model's floor(t_eod_hours/8760) step -- a
+uniform annualized fraction avoids reintroducing the kind of discreteness this whole effort
+removes. Smoothly clipped to <=1 (`_REPL_CLIP_S`, same smooth_min2 construction as elsewhere in
+this file) to match the [0,1] fraction-of-capacity convention other H2Integrate components
+assume; the lower bound is already guaranteed by construction. `power_per_stack` is floored away
+from exact 0 (`_degradation_totals`) before hitting `voltage_fn`'s `sqrt(power)` term, whose
+derivative is infinite at 0 -- real full-year wind data has exact-zero-power hours (via the wind
+surrogate's cut-in floor) that produced NaN gradients here before this guard was added.
+`replacement_schedule` auto-connects to the finance model's `replacement_cost_percent *
+CapEx` term (see h2integrate_model.py), so degradation now has a real CapEx/LCOH consequence --
+verified end-to-end through the real `ProFastLCO` finance component (2026-08-25): LCOH rises
+from 8.78 to 11.82 $/kg with vs. without this wiring on a real wind profile, landing in the
+electrolyzer CapEx bucket of `LCOH_breakdown` as expected, with finite gradients throughout.
+Efficiency loss / VarOpEx from degradation is NOT wired (H2 production stays BOL-only, per the
+class docstring) -- Singlitico OpEx depends only on electrolyzer_size_mw, not degradation, so
+there is no existing OpEx mechanism to hook into without a larger change to H2 production itself.
 """
 
 import numpy as np
@@ -78,6 +96,9 @@ _SAT_CLIP_S_KW = 1.0 / 1000.0
 # rising" -- these two regimes have different slopes in general, so the transition itself (not
 # just the two saturation clips already handled) needs smoothing too.
 _N_ACTIVE_CLIP_S = 5.0
+# Sharpness for the replacement_schedule upper clip at 1.0 (unitless fraction-of-capacity
+# scale): transition half-width ~1/s = 0.02, i.e. 2% of the [0,1] range.
+_REPL_CLIP_S = 50.0
 
 # Scalar (per-timestep-independent) design variables, in argument order after power_kw.
 _SCALAR_ARGS = ("n_clusters", "cluster_rating_mw", "turndown_ratio")
@@ -165,7 +186,11 @@ def _degradation_totals(
     power_per_cluster = power_kw / n_clusters
     soft_on = jax.nn.sigmoid((power_per_cluster - p_min_kw) / width_kw)
 
-    power_per_stack = power_per_cluster / cluster_rating_mw
+    # Floored away from exact 0 before hitting voltage_fn's sqrt(power) term, whose derivative
+    # is infinite at 0 -- same guard _h2_per_timestep already applies before calling stack_fn
+    # (real wind profiles have exact-zero-power hours; unguarded this produces NaN gradients in
+    # n_clusters/cluster_rating_MW/electricity_in, not just a discontinuity).
+    power_per_stack = jnp.maximum(power_per_cluster / cluster_rating_mw, 1e-6)
     voltage = voltage_fn(power_per_stack)
 
     dt_sec = 3600.0
@@ -208,8 +233,9 @@ def _h2_per_timestep(power_kw, n_clusters, cluster_rating_mw, turndown_ratio, st
 class SmoothElectrolyzerPerformanceModelConfig(ECOElectrolyzerPerformanceModelConfig):
     """Same fields as ECOElectrolyzerPerformanceModelConfig. H2 production is BOL-only by
     construction (V_deg=0); degradation is tracked separately as raw diagnostic outputs
-    (uptime_degradation_v/cycling_degradation_v/total_degradation_v) that do NOT feed back into
-    hydrogen_out/efficiency/replacement_schedule."""
+    (uptime_degradation_v/cycling_degradation_v/fatigue_degradation_v/total_degradation_v) that
+    feed into replacement_schedule (and hence CapEx-side LCOH) but do NOT feed back into
+    hydrogen_out/efficiency."""
 
 
 class SmoothElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
@@ -298,6 +324,12 @@ class SmoothElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
         self._steady_deg_rate = _pem_tmp.steady_deg_rate
         self._onoff_deg_rate = _pem_tmp.onoff_deg_rate
         self._rate_fatigue = _pem_tmp.rate_fatigue
+        # calc_stack_replacement_info (the real model's actual replacement-schedule source, via
+        # "Time Until Replacement [hrs]") divides by d_eol_curve[-1], NOT d_eol -- two distinct
+        # calculations (find_eol_voltage_curve's curve-based "simple method" vs
+        # find_eol_voltage_val's single rated-point formula) that happen to be numerically close
+        # at this tech_config (~0.004% apart) but aren't the same calculation in general.
+        self._d_eol = float(_pem_tmp.d_eol_curve[-1])
 
         def _f_uptime(power_kw, n_clusters, cluster_rating_mw, turndown_ratio):
             uptime_v, _, _ = _degradation_totals(
@@ -342,6 +374,7 @@ class SmoothElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
         ann_cols = np.tile(arange, plant_life)
         self.declare_partials("annual_hydrogen_produced", "electricity_in", rows=ann_rows, cols=ann_cols)
         self.declare_partials("capacity_factor", "electricity_in", rows=ann_rows, cols=ann_cols)
+        self.declare_partials("replacement_schedule", "electricity_in", rows=ann_rows, cols=ann_cols)
         deg_outputs = [
             "uptime_degradation_v", "cycling_degradation_v", "fatigue_degradation_v",
             "total_degradation_v",
@@ -358,6 +391,7 @@ class SmoothElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
             self.declare_partials("rated_hydrogen_production", name)
             self.declare_partials("electrolyzer_size_mw", name)
             self.declare_partials("efficiency", name)
+            self.declare_partials("replacement_schedule", name)
             for deg_name in deg_outputs:
                 self.declare_partials(deg_name, name)
 
@@ -380,7 +414,6 @@ class SmoothElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
 
         annual_h2 = total_h2 / self.fraction_of_year_simulated
         outputs["annual_hydrogen_produced"] = np.full(self._plant_life, annual_h2)
-        outputs["replacement_schedule"] = np.zeros(self._plant_life)
         cf = annual_h2 / (rated_h2 * 8760.0) if rated_h2 > 0 else 0.0
         outputs["capacity_factor"] = np.full(self._plant_life, cf)
 
@@ -394,7 +427,30 @@ class SmoothElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
         outputs["uptime_degradation_v"] = float(uptime_v)
         outputs["cycling_degradation_v"] = float(cycling_v)
         outputs["fatigue_degradation_v"] = float(fatigue_v)
-        outputs["total_degradation_v"] = float(uptime_v + cycling_v + fatigue_v)
+        total_deg_v = float(uptime_v + cycling_v + fatigue_v)
+        outputs["total_degradation_v"] = total_deg_v
+
+        # Annualized replacement fraction: real model's frac_of_life_used = d_sim / d_eol,
+        # scaled from the simulated period to a full year (repeated-year assumption already
+        # used by annual_hydrogen_produced), spread uniformly across plant_life instead of the
+        # real model's floor(t_eod/8760) step -- avoids reintroducing the discreteness this
+        # smooth model exists to remove, per 2026-08-25 review.
+        frac_of_life_used = total_deg_v / self._d_eol
+        annualized_replacement_fraction = frac_of_life_used / self.fraction_of_year_simulated
+        # Smoothly clipped to <=1 (fraction of capacity replaced per year), matching the [0,1]
+        # convention other H2Integrate components' tests assume for this output; the lower bound
+        # (0) is already guaranteed by construction since total_deg_v is a sum of non-negative
+        # smooth proxies, so no lower clip is needed. Same smooth_min2 construction/convention as
+        # the other saturation clips in this file (e.g. _N_ACTIVE_CLIP_S).
+        clipped_fraction = float(
+            smooth_min2(jnp.asarray(annualized_replacement_fraction), jnp.asarray(1.0), _REPL_CLIP_S)
+        )
+        # d(clipped)/d(unclipped) for smooth_min2(u, 1, s) = sigmoid(s * (1 - u)); reused in
+        # compute_partials via the chain rule instead of re-deriving through JAX.
+        self._repl_clip_weight = float(
+            1.0 / (1.0 + np.exp(-_REPL_CLIP_S * (1.0 - annualized_replacement_fraction)))
+        )
+        outputs["replacement_schedule"] = np.full(self._plant_life, clipped_fraction)
 
         total_elec_kwh = float(np.sum(inputs["electricity_in"])) * self.dt / 3600.0
         outputs["efficiency"] = (
@@ -487,7 +543,11 @@ class SmoothElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
             partials["uptime_degradation_v", om_name] = d_uptime_s
             partials["cycling_degradation_v", om_name] = d_cycling_s
             partials["fatigue_degradation_v", om_name] = d_fatigue_s
-            partials["total_degradation_v", om_name] = d_uptime_s + d_cycling_s + d_fatigue_s
+            d_total_s = d_uptime_s + d_cycling_s + d_fatigue_s
+            partials["total_degradation_v", om_name] = d_total_s
+            partials["replacement_schedule", om_name] = (
+                self._repl_clip_weight * d_total_s / self._d_eol / self.fraction_of_year_simulated
+            )
 
         d_uptime_power = np.array(self._deg_grad_power["uptime"](*args))
         d_cycling_power = np.array(self._deg_grad_power["cycling"](*args))
@@ -495,6 +555,9 @@ class SmoothElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
         partials["uptime_degradation_v", "electricity_in"] = d_uptime_power
         partials["cycling_degradation_v", "electricity_in"] = d_cycling_power
         partials["fatigue_degradation_v", "electricity_in"] = d_fatigue_power
-        partials["total_degradation_v", "electricity_in"] = (
-            d_uptime_power + d_cycling_power + d_fatigue_power
+        d_total_power = d_uptime_power + d_cycling_power + d_fatigue_power
+        partials["total_degradation_v", "electricity_in"] = d_total_power
+        d_repl_d_power = (
+            self._repl_clip_weight * d_total_power / self._d_eol / self.fraction_of_year_simulated
         )
+        partials["replacement_schedule", "electricity_in"] = np.tile(d_repl_d_power, self._plant_life)
