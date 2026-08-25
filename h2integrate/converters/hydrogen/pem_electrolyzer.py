@@ -96,11 +96,30 @@ def _make_jax_dispatch_h2_fn(h2_per_stack_fn, n_stacks_per_cluster, cluster_rati
     relaxation (smin, via softplus) that approaches the same asymptotes but stays C^inf
     and non-decreasing throughout (steepness UPPER_CLIP_S=8, chosen as a middle ground:
     smooth without noticeably widening the saturation transition).
+
+    Above num_clusters*p_act, n_saturating asymptotes toward num_clusters but never fully
+    caps, so power_per_cluster = power_kw/n_saturating kept rising unboundedly with
+    power_kw -- unphysical (the real dispatch fully saturates once every stack is at rated
+    power) and previously papered over by a hard sat_mask cutoff in compute_partials, which
+    produced a real jump discontinuity in the gradient right at rated capacity (diagnosed
+    2026-08-25, see scan_electrolyzer_saturation_kink.py). Fixed by smooth-capping
+    power_per_cluster at cluster_rating_kw with the same smin relaxation (steepness
+    POWER_CAP_S, tuned so the gradient has decayed to ~0 within ~10-15% above rated
+    capacity, matching where compute_partials' old hard mask used to cut in); the gradient
+    now decays continuously through the boundary instead of jumping to exactly 0, and H2
+    output plateaus at rated capacity instead of climbing without bound.
     """
     p_min = turndown_ratio * cluster_rating_kw
-    GATE_K = 0.01  # 1/kW
+    # GATE_K originally 0.01 (~100 kW transition width), which produced a real derivative
+    # spike (~116 kg/hr/MW, ~5x the surrounding slope) right at p_min from the gate'*(raw-leak)
+    # cross term -- an unintended blending artifact, not a physical feature (diagnosed
+    # 2026-08-25). Softened to 0.003 (~330 kW transition width), which roughly halves the
+    # peak (~46 kg/hr/MW) while still tracking the real onset shape closely; a further
+    # softened 0.0015 was rejected for visibly drifting from the real H2(power) curve.
+    GATE_K = 0.003  # 1/kW
     EPS = 0.0015  # kg/hr per kW, minimum d(H2)/d(power) floor below p_min
     UPPER_CLIP_S = 8.0  # smooth-min steepness for the num_clusters saturation bound
+    POWER_CAP_S = 0.002  # 1/kW, smooth-min steepness for the per-cluster rated-power cap
 
     def h2_per_cluster_kg_hr(power_per_cluster_kw):
         return n_stacks_per_cluster * h2_per_stack_fn(power_per_cluster_kw / n_stacks_per_cluster)
@@ -120,11 +139,12 @@ def _make_jax_dispatch_h2_fn(h2_per_stack_fn, n_stacks_per_cluster, cluster_rati
         n_on = jnp.where(
             power_kw <= p_min, n_ramp_on, jnp.where(power_kw <= p_act, 1.0, n_saturating)
         )
-        power_per_cluster = jnp.where(
+        power_per_cluster_raw = jnp.where(
             power_kw <= p_min,
             p_min,
             jnp.where(power_kw <= p_act, power_kw, power_kw / n_saturating),
         )
+        power_per_cluster = _smin(power_per_cluster_raw, cluster_rating_kw, POWER_CAP_S)
         raw = n_on * h2_per_cluster_kg_hr(power_per_cluster)
         gate = jax.nn.sigmoid(GATE_K * (power_kw - p_min))
         leak = EPS * power_kw
@@ -359,13 +379,17 @@ class ECOElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
             # Use forward-pass output to mask off-timesteps: if run_h2_PEM produced no
             # hydrogen at timestep t, FD also gives 0, so analytic must match.
             on_mask = (self._h2_out_scaled > 0).astype(float) if len(self._h2_out_scaled) == len(elec) else np.ones(len(elec))
-            # Zero out saturated timesteps: external_power_supply() clips per-stack power at
-            # _STACK_RATING_KW once every cluster is on, so beyond that point hydrogen_out no
-            # longer responds and FD correctly gives 0 there too.
-            power_per_stack_full = np.asarray(elec) / float(self._n_total_stacks)
-            sat_mask = (power_per_stack_full < self._STACK_RATING_KW).astype(float)
-            jac_diag = np.array(d_p) * on_mask * sat_mask
-            jac_act = np.array(d_act) * on_mask * sat_mask
+            # NOTE: previously a hard sat_mask zeroed the gradient once power_per_stack hit
+            # _STACK_RATING_KW, mirroring external_power_supply()'s true forward-model clip
+            # exactly -- but that produced a real jump discontinuity in the gradient right at
+            # rated capacity (diagnosed 2026-08-25). _jax_dispatch_fn now smooth-caps
+            # power_per_cluster at cluster_rating_kw itself (see _make_jax_dispatch_h2_fn), so
+            # the gradient decays continuously through saturation instead; the mask is no
+            # longer applied, by the same deliberate-mismatch-for-optimizer-signal rationale
+            # already used for the turndown-floor leak term (a nonzero decaying gradient above
+            # rated capacity vs. the true model's exact 0 there).
+            jac_diag = np.array(d_p) * on_mask
+            jac_act = np.array(d_act) * on_mask
 
         partials["hydrogen_out", "electricity_in"] = jac_diag
         partials["total_hydrogen_produced", "electricity_in"] = jac_diag
