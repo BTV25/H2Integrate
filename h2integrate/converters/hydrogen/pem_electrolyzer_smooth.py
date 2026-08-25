@@ -24,20 +24,30 @@ fixed. This is a deliberate, known simplification (2026-08-25 decision: fast + f
 over refitting the curve per-iteration with an FD partial), matching the same tradeoff flagged
 in the exploratory script's `build_stack_fn` docstring.
 
-Degradation outputs (`uptime_degradation_v`, `cycling_degradation_v`, `total_degradation_v`),
-added 2026-08-25 session 8: smooth proxies for the two turndown-sensitive mechanisms in the real
-discrete model (`calc_uptime_degradation`, `calc_onoff_degradation`), validated against the real
-values in `scripts/explore_electrolyzer_degradation_proxy.py`. Same threshold as dispatch
-(`cluster_min_power = turndown_ratio * cluster_rating_MW`), but as a sigmoid `soft_on(t)` instead
-of a hard step; voltage is the real load-dependent operating voltage
+Degradation outputs (`uptime_degradation_v`, `cycling_degradation_v`, `fatigue_degradation_v`,
+`total_degradation_v`), added 2026-08-25 session 8 (uptime/cycling) and session 9 (fatigue):
+smooth proxies for all three turndown-sensitive mechanisms in the real discrete model
+(`calc_uptime_degradation`, `calc_onoff_degradation`, `approx_fatigue_degradation`), validated
+against the real values in `scripts/explore_electrolyzer_degradation_proxy.py` and
+`scripts/explore_electrolyzer_fatigue_proxy.py`. Uptime/cycling share the same threshold as
+dispatch (`cluster_min_power = turndown_ratio * cluster_rating_MW`), but as a sigmoid
+`soft_on(t)` instead of a hard step; voltage is the real load-dependent operating voltage
 (`_make_jax_voltage_fn`, ported from `cell_design`/`calc_V_act`/`calc_V_ohmic`), not a constant.
 `cycling_deg` sums only the *decreases* in `soft_on` (ReLU), matching the real code's
 off-transition-only cycle count -- this ReLU has the same kind of derivative kink as the
 existing `jnp.maximum` uses elsewhere in this file (e.g. `n_active_raw`), not newly introduced.
+
+Fatigue is a genuinely different mechanism (rainflow peak-valley hysteresis-loop counting on the
+degraded voltage signal) with no closed-form smooth equivalent, so the proxy is a different
+construction: `rate_fatigue * _FATIGUE_K_FIT * total_variation(voltage(t) * soft_on(t))`. Per
+[[feedback_curvature_over_tight_fit]], this matches the real curve's overall increasing trend
+(correlation 0.865 across a turndown sweep) but not its discrete plateaus/local jumps --
+accepted 2026-08-25 as good enough (median rel. error 24%, worst case 158% at a plateau edge).
+`_FATIGUE_K_FIT` is a single constant fit by least squares in the exploration script, not
+re-fit per turndown_ratio.
+
 NOT yet wired into any cost/LCOH output -- these are raw degradation quantities (Volts) only;
-how they should feed into replacement cost / efficiency loss is still open. Rainflow fatigue
-degradation (`approx_fatigue_degradation`, the real model's third mechanism) is NOT covered --
-queued for a future session.
+how they should feed into replacement cost / efficiency loss is still open.
 """
 
 import numpy as np
@@ -88,6 +98,11 @@ def smooth_min2(a, b, s):
 # _SAT_CLIP_S_KW/_N_ACTIVE_CLIP_S, validated in explore_electrolyzer_degradation_proxy.py.
 _SOFT_ON_WIDTH_FRAC = 0.02
 
+# Total-variation-to-rainflow scale constant for the fatigue proxy, least-squares fit in
+# explore_electrolyzer_fatigue_proxy.py across a turndown_ratio sweep on the baseline wind
+# profile (correlation 0.865 vs the real rainflow-counted values; not re-fit per input).
+_FATIGUE_K_FIT = 0.928
+
 
 def _make_jax_voltage_fn(curve_coeff):
     """JAX-differentiable cell voltage (V) for one 1 MW stack, given its power (kW).
@@ -132,15 +147,18 @@ def _make_jax_voltage_fn(curve_coeff):
 
 def _degradation_totals(
     power_kw, n_clusters, cluster_rating_mw, turndown_ratio,
-    voltage_fn, steady_deg_rate, onoff_deg_rate,
+    voltage_fn, steady_deg_rate, onoff_deg_rate, rate_fatigue,
 ):
-    """Smooth proxies (V) for real-model uptime and on/off-cycling degradation over the sim.
+    """Smooth proxies (V) for real-model uptime, on/off-cycling, and fatigue degradation.
 
     soft_on(t) in [0, 1] replaces the real model's hard cluster_status step at the same
     threshold (cluster_min_power = turndown_ratio * cluster_rating_mw). Voltage is evaluated at
     the same per-stack power split the real model uses when fully on (power_per_cluster /
     cluster_rating_mw -- 1 MW per stack), weighted by soft_on rather than gated to zero, so it
     stays smooth in electricity_in/turndown_ratio/cluster_rating_mw/n_clusters.
+
+    fatigue_deg_v replaces the real model's rainflow cycle-counting with total variation of the
+    same soft-gated voltage signal (see module docstring / _FATIGUE_K_FIT).
     """
     p_min_kw = turndown_ratio * 1000.0 * cluster_rating_mw
     width_kw = _SOFT_ON_WIDTH_FRAC * 1000.0 * cluster_rating_mw
@@ -154,7 +172,12 @@ def _degradation_totals(
     uptime_deg_v = steady_deg_rate * dt_sec * jnp.sum(voltage * soft_on)
     decreases = jnp.maximum(soft_on[:-1] - soft_on[1:], 0.0)
     cycling_deg_v = onoff_deg_rate * jnp.sum(decreases)
-    return uptime_deg_v, cycling_deg_v
+
+    v_gated = voltage * soft_on
+    tv = jnp.sum(jnp.abs(v_gated[1:] - v_gated[:-1]))
+    fatigue_deg_v = rate_fatigue * _FATIGUE_K_FIT * tv
+
+    return uptime_deg_v, cycling_deg_v, fatigue_deg_v
 
 
 def _h2_per_timestep(power_kw, n_clusters, cluster_rating_mw, turndown_ratio, stack_fn):
@@ -240,7 +263,11 @@ class SmoothElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
             "cycling_degradation_v", val=0.0, units="V", desc="Smooth on/off cycling degradation proxy"
         )
         self.add_output(
-            "total_degradation_v", val=0.0, units="V", desc="uptime + cycling degradation proxy"
+            "fatigue_degradation_v", val=0.0, units="V", desc="Smooth rainflow fatigue degradation proxy"
+        )
+        self.add_output(
+            "total_degradation_v", val=0.0, units="V",
+            desc="uptime + cycling + fatigue degradation proxy",
         )
 
         _pem_tmp = _PEMClusters(
@@ -270,24 +297,32 @@ class SmoothElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
         self._voltage_fn = _make_jax_voltage_fn(_pem_tmp.curve_coeff)
         self._steady_deg_rate = _pem_tmp.steady_deg_rate
         self._onoff_deg_rate = _pem_tmp.onoff_deg_rate
+        self._rate_fatigue = _pem_tmp.rate_fatigue
 
         def _f_uptime(power_kw, n_clusters, cluster_rating_mw, turndown_ratio):
-            uptime_v, _ = _degradation_totals(
+            uptime_v, _, _ = _degradation_totals(
                 power_kw, n_clusters, cluster_rating_mw, turndown_ratio,
-                self._voltage_fn, self._steady_deg_rate, self._onoff_deg_rate,
+                self._voltage_fn, self._steady_deg_rate, self._onoff_deg_rate, self._rate_fatigue,
             )
             return uptime_v
 
         def _f_cycling(power_kw, n_clusters, cluster_rating_mw, turndown_ratio):
-            _, cycling_v = _degradation_totals(
+            _, cycling_v, _ = _degradation_totals(
                 power_kw, n_clusters, cluster_rating_mw, turndown_ratio,
-                self._voltage_fn, self._steady_deg_rate, self._onoff_deg_rate,
+                self._voltage_fn, self._steady_deg_rate, self._onoff_deg_rate, self._rate_fatigue,
             )
             return cycling_v
 
+        def _f_fatigue(power_kw, n_clusters, cluster_rating_mw, turndown_ratio):
+            _, _, fatigue_v = _degradation_totals(
+                power_kw, n_clusters, cluster_rating_mw, turndown_ratio,
+                self._voltage_fn, self._steady_deg_rate, self._onoff_deg_rate, self._rate_fatigue,
+            )
+            return fatigue_v
+
         # Scalar in, scalar out (already reduced over time) -- no vmap needed, jax.grad on the
         # vector arg (power_kw) directly returns the per-timestep gradient vector.
-        self._deg_fns = {"uptime": _f_uptime, "cycling": _f_cycling}
+        self._deg_fns = {"uptime": _f_uptime, "cycling": _f_cycling, "fatigue": _f_fatigue}
         self._deg_grad_power = {k: jax.grad(f, argnums=0) for k, f in self._deg_fns.items()}
         self._deg_grad_scalar = {
             k: {name: jax.grad(f, argnums=i + 1) for i, name in enumerate(_SCALAR_ARGS)}
@@ -307,7 +342,10 @@ class SmoothElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
         ann_cols = np.tile(arange, plant_life)
         self.declare_partials("annual_hydrogen_produced", "electricity_in", rows=ann_rows, cols=ann_cols)
         self.declare_partials("capacity_factor", "electricity_in", rows=ann_rows, cols=ann_cols)
-        deg_outputs = ["uptime_degradation_v", "cycling_degradation_v", "total_degradation_v"]
+        deg_outputs = [
+            "uptime_degradation_v", "cycling_degradation_v", "fatigue_degradation_v",
+            "total_degradation_v",
+        ]
         for deg_name in deg_outputs:
             self.declare_partials(deg_name, "electricity_in", rows=zeros, cols=arange)
 
@@ -349,13 +387,14 @@ class SmoothElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
         outputs["electrolyzer_size_mw"] = n_clusters * cluster_rating_mw
         outputs["time_until_replacement"] = self.config.uptime_hours_until_eol
 
-        uptime_v, cycling_v = _degradation_totals(
+        uptime_v, cycling_v, fatigue_v = _degradation_totals(
             power_kw, n_clusters, cluster_rating_mw, turndown_ratio,
-            self._voltage_fn, self._steady_deg_rate, self._onoff_deg_rate,
+            self._voltage_fn, self._steady_deg_rate, self._onoff_deg_rate, self._rate_fatigue,
         )
         outputs["uptime_degradation_v"] = float(uptime_v)
         outputs["cycling_degradation_v"] = float(cycling_v)
-        outputs["total_degradation_v"] = float(uptime_v + cycling_v)
+        outputs["fatigue_degradation_v"] = float(fatigue_v)
+        outputs["total_degradation_v"] = float(uptime_v + cycling_v + fatigue_v)
 
         total_elec_kwh = float(np.sum(inputs["electricity_in"])) * self.dt / 3600.0
         outputs["efficiency"] = (
@@ -444,12 +483,18 @@ class SmoothElectrolyzerPerformanceModel(ElectrolyzerPerformanceBaseClass):
 
             d_uptime_s = float(self._deg_grad_scalar["uptime"][key](*args))
             d_cycling_s = float(self._deg_grad_scalar["cycling"][key](*args))
+            d_fatigue_s = float(self._deg_grad_scalar["fatigue"][key](*args))
             partials["uptime_degradation_v", om_name] = d_uptime_s
             partials["cycling_degradation_v", om_name] = d_cycling_s
-            partials["total_degradation_v", om_name] = d_uptime_s + d_cycling_s
+            partials["fatigue_degradation_v", om_name] = d_fatigue_s
+            partials["total_degradation_v", om_name] = d_uptime_s + d_cycling_s + d_fatigue_s
 
         d_uptime_power = np.array(self._deg_grad_power["uptime"](*args))
         d_cycling_power = np.array(self._deg_grad_power["cycling"](*args))
+        d_fatigue_power = np.array(self._deg_grad_power["fatigue"](*args))
         partials["uptime_degradation_v", "electricity_in"] = d_uptime_power
         partials["cycling_degradation_v", "electricity_in"] = d_cycling_power
-        partials["total_degradation_v", "electricity_in"] = d_uptime_power + d_cycling_power
+        partials["fatigue_degradation_v", "electricity_in"] = d_fatigue_power
+        partials["total_degradation_v", "electricity_in"] = (
+            d_uptime_power + d_cycling_power + d_fatigue_power
+        )
